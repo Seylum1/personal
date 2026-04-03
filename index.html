@@ -1,0 +1,1819 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HMCS Brunswicker — Deliverable Tracker</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; }
+    body { margin: 0; background: #0a1628; }
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: #0a1628; }
+    ::-webkit-scrollbar-thumb { background: #1e3a5f; border-radius: 3px; }
+    input[type=date]::-webkit-calendar-picker-indicator { filter: invert(0.6); }
+
+    /* Lock screen animations */
+    @keyframes fadeInDown {
+      from { opacity: 0; transform: translateY(-32px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes fadeInUp {
+      from { opacity: 0; transform: translateY(24px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    @keyframes pulseGold {
+      0%, 100% { box-shadow: 0 0 0 0 rgba(200,168,75,0); }
+      50%       { box-shadow: 0 0 32px 8px rgba(200,168,75,0.18); }
+    }
+    @keyframes scanline {
+      0%   { transform: translateY(-100%); }
+      100% { transform: translateY(100vh); }
+    }
+    @keyframes unlockPulse {
+      0%   { box-shadow: 0 0 0 0 rgba(74,222,128,0.6); }
+      70%  { box-shadow: 0 0 0 18px rgba(74,222,128,0); }
+      100% { box-shadow: 0 0 0 0 rgba(74,222,128,0); }
+    }
+    @keyframes shake {
+      0%,100% { transform: translateX(0); }
+      20%,60% { transform: translateX(-8px); }
+      40%,80% { transform: translateX(8px); }
+    }
+    @keyframes shimmer {
+      0%   { background-position: -400px 0; }
+      100% { background-position: 400px 0; }
+    }
+    .lock-title   { animation: fadeInDown 0.7s cubic-bezier(.22,1,.36,1) both; }
+    .lock-form    { animation: fadeInUp  0.7s cubic-bezier(.22,1,.36,1) 0.2s both; }
+    .lock-shake   { animation: shake 0.4s ease; }
+    .lock-unlock  { animation: unlockPulse 0.6s ease; }
+    .lock-shimmer {
+      background: linear-gradient(90deg, transparent 0%, rgba(200,168,75,0.15) 50%, transparent 100%);
+      background-size: 400px 100%;
+      animation: shimmer 2.2s infinite linear;
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <!-- ══════════════════════════════════════════════════════════════════
+       GOOGLE SHEETS STORAGE BACKEND
+       1. Deploy Code.gs as a Web App in Google Apps Script
+       2. Paste your /exec URL below as APPS_SCRIPT_URL
+       ══════════════════════════════════════════════════════════════════ -->
+  <script>
+    const APPS_SCRIPT_URL = "PASTE_YOUR_APPS_SCRIPT_URL_HERE";
+
+    // Storage shim — maps window.storage.get/set to the Apps Script backend.
+    // Falls back gracefully to in-memory if URL is not configured.
+    const _memStore = {};
+    window.storage = {
+      async get(key) {
+        if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes("PASTE_YOUR")) {
+          return _memStore[key] != null ? { key, value: _memStore[key] } : null;
+        }
+        try {
+          const r = await fetch(`${APPS_SCRIPT_URL}?key=${encodeURIComponent(key)}`, { redirect: "follow" });
+          const data = await r.json();
+          return data.value != null ? { key, value: data.value } : null;
+        } catch(e) {
+          console.warn("storage.get failed:", e);
+          return _memStore[key] != null ? { key, value: _memStore[key] } : null;
+        }
+      },
+      async set(key, value) {
+        _memStore[key] = value; // keep in-memory copy as cache
+        if (!APPS_SCRIPT_URL || APPS_SCRIPT_URL.includes("PASTE_YOUR")) return { key, value };
+        try {
+          const r = await fetch(APPS_SCRIPT_URL, {
+            method: "POST",
+            redirect: "follow",
+            headers: { "Content-Type": "text/plain" },
+            body: JSON.stringify({ key, value })
+          });
+          return r.json();
+        } catch(e) {
+          console.warn("storage.set failed:", e);
+          return null;
+        }
+      },
+      async delete(key) {
+        delete _memStore[key];
+        return { key, deleted: true };
+      }
+    };
+  </script>
+
+  <script type="text/babel">
+    const { useState, useEffect, useRef } = React;
+
+const PASSWORD_KEY = "hmcs-brunswicker-auth";
+
+function LockScreen({ onUnlock }) {
+  const [phase, setPhase]         = useState("loading"); // loading | set | lock | wrong | unlocking
+  const [input, setInput]         = useState("");
+  const [confirm, setConfirm]     = useState("");
+  const [showPw, setShowPw]       = useState(false);
+  const inputRef                  = useRef(null);
+
+  useEffect(() => {
+    (async () => {
+      // Brief cinematic pause so the lock screen can actually be appreciated
+      await new Promise(r => setTimeout(r, 900));
+      const stored = await window.storage.get(PASSWORD_KEY);
+      setPhase(stored?.value ? "lock" : "set");
+      setTimeout(() => inputRef.current?.focus(), 100);
+    })();
+  }, []);
+
+  const hash = async (str) => {
+    const buf = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(str));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2,"0")).join("");
+  };
+
+  const handleSet = async () => {
+    if (input.length < 4) return;
+    if (input !== confirm) { setPhase("wrong"); setTimeout(() => setPhase("set"), 600); return; }
+    const h = await hash(input);
+    await window.storage.set(PASSWORD_KEY, h);
+    setPhase("unlocking");
+    setTimeout(onUnlock, 900);
+  };
+
+  const handleUnlock = async () => {
+    const stored = await window.storage.get(PASSWORD_KEY);
+    const h = await hash(input);
+    if (h === stored?.value) {
+      setPhase("unlocking");
+      setTimeout(onUnlock, 900);
+    } else {
+      setPhase("wrong");
+      setInput("");
+      setTimeout(() => setPhase("lock"), 700);
+    }
+  };
+
+  const onKey = (e) => { if (e.key === "Enter") phase === "set" ? handleSet() : handleUnlock(); };
+
+  const gold = "#c8a84b", bg = "#0a1628", surface = "#11223a", border = "#1e3a5f", blue = "#8aafc8", text = "#e2e8f0", muted = "#6a8faf";
+
+  // Scanline overlay
+  const Scanline = () => (
+    <div style={{ position:"fixed", inset:0, pointerEvents:"none", zIndex:0, overflow:"hidden", opacity:0.04 }}>
+      <div style={{ position:"absolute", left:0, right:0, height:"40%", background:"linear-gradient(to bottom, transparent, rgba(200,168,75,0.4), transparent)", animation:"scanline 4s linear infinite" }} />
+    </div>
+  );
+
+  // Grid lines background
+  const Grid = () => (
+    <div style={{ position:"fixed", inset:0, pointerEvents:"none", zIndex:0,
+      backgroundImage:`linear-gradient(${border}44 1px, transparent 1px), linear-gradient(90deg, ${border}44 1px, transparent 1px)`,
+      backgroundSize:"40px 40px", opacity:0.5 }} />
+  );
+
+  if (phase === "loading") return (
+    <div style={{ position:"fixed", inset:0, background:bg, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
+      <Grid /><Scanline />
+      <div style={{ position:"relative", zIndex:1, textAlign:"center" }}>
+        <div style={{ color:gold, fontSize:11, letterSpacing:6, fontWeight:700, textTransform:"uppercase", marginBottom:18, opacity:0.7 }}>Initializing Secure Session</div>
+        <div style={{ display:"flex", gap:10, justifyContent:"center" }}>
+          {[0,1,2].map(i => (
+            <div key={i} style={{ width:8, height:8, borderRadius:"50%", background:gold, opacity:0.3,
+              animation:`pulseGold 1.2s ease-in-out ${i*0.2}s infinite` }} />
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+
+  if (phase === "unlocking") return (
+    <div style={{ position:"fixed", inset:0, background:bg, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:9999 }}>
+      <Grid /><Scanline />
+      <div style={{ position:"relative", zIndex:1, textAlign:"center" }}>
+        <div style={{ width:64, height:64, borderRadius:"50%", background:"#0f2e1a", border:"2px solid #4ade80", display:"flex", alignItems:"center", justifyContent:"center", margin:"0 auto 20px", animation:"unlockPulse 0.6s ease forwards", fontSize:28 }}>✓</div>
+        <div style={{ color:"#4ade80", fontSize:13, fontWeight:700, letterSpacing:4, textTransform:"uppercase" }}>Access Granted</div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:bg, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", zIndex:9999, fontFamily:"'Segoe UI', system-ui, sans-serif" }}>
+      <Grid /><Scanline />
+
+      {/* Glowing orb behind crest */}
+      <div style={{ position:"absolute", width:320, height:320, borderRadius:"50%", background:`radial-gradient(circle, ${gold}18 0%, transparent 70%)`, pointerEvents:"none", animation:"pulseGold 3s ease-in-out infinite" }} />
+
+      <div style={{ position:"relative", zIndex:1, width:"100%", maxWidth:420, padding:"0 24px" }}>
+        {/* Crest + Title */}
+        <div className="lock-title" style={{ textAlign:"center", marginBottom:40 }}>
+          <div style={{ fontSize:48, marginBottom:8, filter:"drop-shadow(0 0 12px rgba(200,168,75,0.5))" }}>⚓</div>
+          <div style={{ color:gold, fontSize:9, letterSpacing:6, fontWeight:700, textTransform:"uppercase", marginBottom:6 }}>Her Majesty's Canadian Ship</div>
+          <div style={{ color:"#fff", fontSize:32, fontWeight:800, letterSpacing:2, lineHeight:1, marginBottom:6 }}>BRUNSWICKER</div>
+          <div style={{ color:muted, fontSize:10, letterSpacing:3, fontStyle:"italic" }}>Pacis Tuendae Causa</div>
+          <div style={{ margin:"16px auto 0", width:60, height:1, background:`linear-gradient(90deg, transparent, ${gold}, transparent)` }} />
+        </div>
+
+        {/* Form box */}
+        <div className="lock-form" style={{ background:surface, border:`1px solid ${phase === "wrong" ? "#f87171" : border}`, borderRadius:14, padding:"28px 28px 24px", transition:"border-color 0.3s" }}>
+          {/* Shimmer strip at top */}
+          <div className="lock-shimmer" style={{ height:2, borderRadius:2, marginBottom:24 }} />
+
+          <div style={{ color:gold, fontSize:11, fontWeight:700, textTransform:"uppercase", letterSpacing:2, marginBottom:18, textAlign:"center" }}>
+            {phase === "set" ? "🔐 Create Access Code" : phase === "wrong" ? "⚠ Incorrect — Try Again" : "🔒 Restricted Access"}
+          </div>
+
+          {phase === "set" && (
+            <div style={{ color:muted, fontSize:12, textAlign:"center", marginBottom:20, lineHeight:1.6 }}>
+              No access code set. Choose a passphrase — this will be required every time you open the app.
+            </div>
+          )}
+
+          <div className={phase === "wrong" ? "lock-shake" : ""} style={{ display:"flex", flexDirection:"column", gap:12 }}>
+            <div style={{ position:"relative" }}>
+              <input
+                ref={inputRef}
+                type={showPw ? "text" : "password"}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={onKey}
+                placeholder={phase === "set" ? "Choose a passphrase…" : "Enter passphrase…"}
+                style={{ background:"#0a1628", color:text, border:`1px solid ${border}`, borderRadius:8, padding:"12px 44px 12px 16px", fontSize:15, width:"100%", outline:"none", letterSpacing: showPw ? 0 : 3 }}
+              />
+              <button onClick={() => setShowPw(v => !v)} style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:muted, cursor:"pointer", fontSize:16, padding:0 }}>
+                {showPw ? "🙈" : "👁"}
+              </button>
+            </div>
+
+            {phase === "set" && (
+              <input
+                type={showPw ? "text" : "password"}
+                value={confirm}
+                onChange={e => setConfirm(e.target.value)}
+                onKeyDown={onKey}
+                placeholder="Confirm passphrase…"
+                style={{ background:"#0a1628", color:text, border:`1px solid ${confirm && confirm !== input ? "#f87171" : border}`, borderRadius:8, padding:"12px 16px", fontSize:15, width:"100%", outline:"none", letterSpacing: showPw ? 0 : 3 }}
+              />
+            )}
+
+            {phase === "set" && confirm && confirm !== input && (
+              <div style={{ color:"#f87171", fontSize:11, textAlign:"center" }}>Passphrases don't match</div>
+            )}
+
+            <button
+              onClick={phase === "set" ? handleSet : handleUnlock}
+              disabled={phase === "set" ? (input.length < 4 || input !== confirm) : input.length === 0}
+              style={{ background: (phase === "set" ? (input.length < 4 || input !== confirm) : input.length === 0) ? "#1a3a5c" : gold,
+                color: (phase === "set" ? (input.length < 4 || input !== confirm) : input.length === 0) ? muted : bg,
+                border:"none", borderRadius:8, padding:"13px", fontSize:14, fontWeight:800, cursor:"pointer",
+                letterSpacing:2, textTransform:"uppercase", transition:"all 0.2s", marginTop:4 }}>
+              {phase === "set" ? "Set Access Code" : "Authenticate"}
+            </button>
+          </div>
+
+          <div style={{ color:muted, fontSize:10, textAlign:"center", marginTop:16, letterSpacing:1 }}>
+            HMCS Brunswicker · Naval Reserve · Saint John NB
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Root() {
+  const [unlocked, setUnlocked] = useState(false);
+  if (!unlocked) return <LockScreen onUnlock={() => setUnlocked(true)} />;
+  return <App />;
+}
+
+
+const STORAGE_KEY        = "hmcs-brunswicker-deliverables";
+const NOTES_STORAGE_KEY  = "hmcs-brunswicker-day-notes";
+const OFFICE_STORAGE_KEY = "hmcs-brunswicker-office-days";
+const CLASSB_STORAGE_KEY = "hmcs-brunswicker-classb-contracts";
+const PAYSTUBS_KEY       = "hmcs-brunswicker-paystubs";
+const RECURRING_KEY      = "hmcs-brunswicker-recurring";
+
+const STATUSES    = ["Not Started", "In Progress", "Under Review", "Complete", "Overdue"];
+const PRIORITIES  = ["Low", "Medium", "High", "Urgent"];
+const DEPARTMENTS = ["Logistics", "Executive", "Deck", "Administration", "Training", "BM(O)Q Division", "Personal"];
+const PRIORITY_ORDER = { Urgent: 0, High: 1, Medium: 2, Low: 3 };
+const MONTH_NAMES = ["January","February","March","April","May","June","July","August","September","October","November","December"];
+const DAY_NAMES   = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"];
+
+const STATUS_COLORS = {
+  "Not Started":  "bg-gray-200 text-gray-800",
+  "In Progress":  "bg-yellow-200 text-yellow-900",
+  "Under Review": "bg-orange-200 text-orange-900",
+  "Complete":     "bg-green-200 text-green-900",
+  "Overdue":      "bg-red-200 text-red-900",
+};
+const PRIORITY_COLORS = {
+  "Low":    "bg-slate-100 text-slate-700",
+  "Medium": "bg-amber-100 text-amber-800",
+  "High":   "bg-orange-200 text-orange-900",
+  "Urgent": "bg-red-200 text-red-900",
+};
+const DEPT_COLORS = {
+  "Logistics":       "bg-green-200 text-green-900",
+  "Personal":        "bg-teal-200 text-teal-900",
+  "Training":        "bg-red-200 text-red-900",
+  "BM(O)Q Division": "bg-red-900 text-red-200",
+  "Executive":       "bg-yellow-200 text-yellow-900",
+  "Administration":  "bg-purple-200 text-purple-900",
+  "Deck":            "bg-gray-200 text-gray-800",
+};
+const ROW_BG = {
+  "Overdue":  { bg: "#3a0f0f", border: "#f87171" },
+  "Complete": { bg: "#0f2e1a", border: "#4ade80" },
+};
+const CAL_COLORS = {
+  "Not Started":  "#94a3b8",
+  "In Progress":  "#facc15",
+  "Under Review": "#fb923c",
+  "Complete":     "#4ade80",
+  "Overdue":      "#f87171",
+};
+
+const OFFICE_STATUSES = {
+  "Out of Office": { bg: null,      halfBg: false, label: "⚪ Out of Office", color: null,      abbr: null   },
+  "Half Day":      { bg: "#0e2a1a", halfBg: true,  label: "🟢 Half Day",      color: "#4ade80",  abbr: "½"    },
+  "Full Day":      { bg: "#0e2a1a", halfBg: false, label: "🟢 Full Day",      color: "#4ade80",  abbr: "IN"   },
+  "Full Plus Day": { bg: "repeating-linear-gradient(45deg, #0e2a1a, #0e2a1a 5px, #1d4a28 5px, #1d4a28 10px)", halfBg: false, label: "🟢 Full Plus Day",      color: "#86efac", abbr: "IN+"  },
+  "Half-In Half-CTO": { bg: null, halfBg: false, splitBg: true, splitTop: "#0e2a1a", splitBot: "#2a0f0f", label: "🟢🔴 Half-In Half-CTO", color: "#f87171", abbr: "½C"  },
+  "Special Leave": { bg: "#2a2200", halfBg: false, label: "🟡 Special Leave", color: "#facc15",  abbr: "SL"   },
+  "Annual Leave":  { bg: "#0d1e35", halfBg: false, label: "🔵 Annual Leave",  color: "#60a5fa",  abbr: "AL"   },
+  "CTO":           { bg: "#2a0f0f", halfBg: false, label: "🔴 CTO",           color: "#f87171",  abbr: "CTO"  },
+  "Appointment":   { bg: "#1a1a1a", halfBg: false, label: "⬜ Appointment",   color: "#94a3b8",  abbr: "APT"  },
+};
+const OFFICE_OPTIONS = Object.keys(OFFICE_STATUSES);
+
+const EMPTY_FORM  = { title: "", description: "", status: "Not Started", priority: "Medium", dueDate: "", notes: "", department: "" };
+const EMPTY_PHASE = { name: "", dueDate: "", status: "Not Started", waitingOn: "" };
+const C = { bg: "#0a1628", surface: "#11223a", surfaceAlt: "#0f1e33", surfaceDeep: "#0d1e35", border: "#1e3a5f", gold: "#c8a84b", blue: "#8aafc8", text: "#e2e8f0", muted: "#6a8faf", faint: "#4a6a8a" };
+
+function Badge({ label, colorClass }) {
+  return <span className={`px-2 py-0.5 rounded text-xs font-semibold ${colorClass}`}>{label}</span>;
+}
+const fieldStyle = { background: "#0a1628", color: "#e2e8f0", border: "1px solid #1e3a5f", borderRadius: 6, padding: "8px 12px", fontSize: 14, width: "100%", boxSizing: "border-box", colorScheme: "dark" };
+const Field = ({ label, children }) => (
+  <div>
+    <label style={{ color: "#8aafc8", fontSize: 11, fontWeight: 700, display: "block", marginBottom: 5, textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</label>
+    {children}
+  </div>
+);
+const TextInput = ({ value, onChange, placeholder, type = "text" }) => (
+  <input type={type} value={value} onChange={e => onChange(e.target.value)} placeholder={placeholder} style={fieldStyle} />
+);
+const Select = ({ value, onChange, options, placeholder }) => (
+  <select value={value} onChange={e => onChange(e.target.value)} style={{ ...fieldStyle, padding: "8px 10px" }}>
+    {placeholder && <option value="">{placeholder}</option>}
+    {options.map(o => <option key={o}>{o}</option>)}
+  </select>
+);
+const TabBtn = ({ id, label, active, onClick }) => (
+  <button onClick={() => onClick(id)} style={{ padding: "10px 28px", fontWeight: 700, fontSize: 12, cursor: "pointer", border: "none", borderBottom: active ? `3px solid ${C.gold}` : "3px solid transparent", background: "transparent", color: active ? C.gold : C.blue, letterSpacing: 1, textTransform: "uppercase" }}>
+    {label}
+  </button>
+);
+const ModalOverlay = ({ children }) => (
+  <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.75)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 16 }}>{children}</div>
+);
+
+function getWeekBounds() {
+  const now = new Date();
+  const mon = new Date(now); mon.setDate(now.getDate() - ((now.getDay() + 6) % 7)); mon.setHours(0,0,0,0);
+  const sun = new Date(mon); sun.setDate(mon.getDate() + 6); sun.setHours(23,59,59,999);
+  return { mon, sun };
+}
+const toISO   = d => d.toISOString().split("T")[0];
+const fmtDate = d => d ? new Date(d + "T00:00:00").toLocaleDateString("en-CA", { year: "numeric", month: "short", day: "numeric" }) : "—";
+const fmtDay  = d => d ? new Date(d + "T00:00:00").toLocaleDateString("en-CA", { weekday: "short", month: "short", day: "numeric" }) : "—";
+
+function App() {
+  const [deliverables,    setDeliverables]    = useState([]);
+  const [loaded,          setLoaded]          = useState(false);
+  const [tab,             setTab]             = useState("tracker");
+  const [showForm,        setShowForm]        = useState(false);
+  const [form,            setForm]            = useState(EMPTY_FORM);
+  const [editId,          setEditId]          = useState(null);
+  const [filterStatus,    setFilterStatus]    = useState("All");
+  const [filterPriority,  setFilterPriority]  = useState("All");
+  const [sortField,       setSortField]       = useState("dueDate");
+  const [groupByDept,     setGroupByDept]     = useState(false);
+  const [showRelevant,    setShowRelevant]    = useState(false);
+  const [confirmDelete,   setConfirmDelete]   = useState(null);
+  const [expanded,        setExpanded]        = useState({});
+  const [phaseForm,       setPhaseForm]       = useState(null);
+  const [phaseData,       setPhaseData]       = useState(EMPTY_PHASE);
+  const [calDate,         setCalDate]         = useState(new Date());
+  const [selectedDay,     setSelectedDay]     = useState(null);
+  const [dayNotes,        setDayNotes]        = useState({});
+  const [officeDays,      setOfficeDays]      = useState({});
+  const [editingNote,     setEditingNote]     = useState(false);
+  const [noteText,        setNoteText]        = useState("");
+  const EMPTY_CLASSB = { label: "", start: "", end: "", tdPerDiem: false, mealDays: [], mealBreakfast: true, mealLunch: true, mealDinner: true, fieldDays: 0, instructorPostedToSchool: false, instructorDuty: false };
+  const EMPTY_RECURRING = { label: "", daysOfWeek: [], startDate: "", endDate: "", badge: "⚓", color: "#8aafc8" };
+  const [classBContracts,   setClassBContracts]   = useState([]);
+  const [showClassBForm,    setShowClassBForm]     = useState(false);
+  const [classBForm,        setClassBForm]         = useState(EMPTY_CLASSB);
+  const [editClassBId,      setEditClassBId]       = useState(null);
+  const [payStubs,          setPayStubs]           = useState({});
+  const [recurringDuties,   setRecurringDuties]    = useState([]);
+  const [showRecurringForm, setShowRecurringForm]  = useState(false);
+  const [recurringForm,     setRecurringForm]      = useState(EMPTY_RECURRING);
+  const [editRecurringId,   setEditRecurringId]    = useState(null);
+  const [showYTD,           setShowYTD]            = useState(false);
+  const [journalDate,       setJournalDate]        = useState(() => new Date().toISOString().split("T")[0]);
+
+  useEffect(() => {
+    (async () => {
+      try { const r = await window.storage.get(STORAGE_KEY);        if (r?.value) setDeliverables(JSON.parse(r.value)); } catch {}
+      try { const r = await window.storage.get(NOTES_STORAGE_KEY);  if (r?.value) setDayNotes(JSON.parse(r.value)); } catch {}
+      try { const r = await window.storage.get(OFFICE_STORAGE_KEY); if (r?.value) setOfficeDays(JSON.parse(r.value)); } catch {}
+      try { const r = await window.storage.get(CLASSB_STORAGE_KEY); if (r?.value) setClassBContracts(JSON.parse(r.value)); } catch {}
+      try { const r = await window.storage.get(PAYSTUBS_KEY);       if (r?.value) setPayStubs(JSON.parse(r.value)); } catch {}
+      try { const r = await window.storage.get(RECURRING_KEY);      if (r?.value) setRecurringDuties(JSON.parse(r.value)); } catch {}
+      setLoaded(true);
+    })();
+  }, []);
+  useEffect(() => {
+    if (!loaded) return;
+    window.storage.set(STORAGE_KEY,        JSON.stringify(deliverables)).catch(() => {});
+    window.storage.set(NOTES_STORAGE_KEY,  JSON.stringify(dayNotes)).catch(() => {});
+    window.storage.set(OFFICE_STORAGE_KEY, JSON.stringify(officeDays)).catch(() => {});
+    window.storage.set(CLASSB_STORAGE_KEY, JSON.stringify(classBContracts)).catch(() => {});
+    window.storage.set(PAYSTUBS_KEY,       JSON.stringify(payStubs)).catch(() => {});
+    window.storage.set(RECURRING_KEY,      JSON.stringify(recurringDuties)).catch(() => {});
+  }, [deliverables, dayNotes, officeDays, classBContracts, payStubs, recurringDuties, loaded]);
+
+  const today = new Date().toISOString().split("T")[0];
+  const { mon, sun } = getWeekBounds();
+  const weekStart = toISO(mon), weekEnd = toISO(sun);
+  const in5 = new Date(); in5.setDate(in5.getDate() + 5);
+  const in5ISO = toISO(in5);
+
+  const processed = deliverables.map(d => ({
+    ...d,
+    status: d.status !== "Complete" && d.dueDate && d.dueDate < today ? "Overdue" : d.status,
+    phases: (d.phases || []).map(p => ({ ...p, status: p.status !== "Complete" && p.dueDate && p.dueDate < today ? "Overdue" : p.status })),
+  }));
+
+  const filtered = processed
+    .filter(d => filterStatus   === "All" || d.status   === filterStatus)
+    .filter(d => filterPriority === "All" || d.priority === filterPriority)
+    .filter(d => !showRelevant  || d.status === "Overdue" || (d.dueDate && d.dueDate >= today && d.dueDate <= in5ISO))
+    .sort((a, b) => {
+      if (sortField === "dueDate")  return (a.dueDate || "9999") < (b.dueDate || "9999") ? -1 : 1;
+      if (sortField === "priority") return PRIORITIES.indexOf(b.priority) - PRIORITIES.indexOf(a.priority);
+      return a.title.localeCompare(b.title);
+    });
+
+  const tableRows = groupByDept
+    ? [...DEPARTMENTS, "Unassigned"].flatMap(dept => {
+        const items = filtered.filter(d => (d.department || "Unassigned") === dept);
+        return items.length > 0 ? [{ _isHeader: true, dept, count: items.length }, ...items] : [];
+      })
+    : filtered;
+
+  const stats = {
+    total:      processed.length,
+    inProgress: processed.filter(d => d.status === "In Progress").length,
+    complete:   processed.filter(d => d.status === "Complete").length,
+    overdue:    processed.filter(d => d.status === "Overdue").length,
+    urgent:     processed.filter(d => d.priority === "Urgent" && d.status !== "Complete").length,
+  };
+
+  const calEvents = {};
+  const addEvent = (date, ev) => { if (!date) return; calEvents[date] = calEvents[date] || []; calEvents[date].push(ev); };
+  processed.forEach(d => {
+    const phases = d.phases || [];
+    if (phases.length > 0) phases.forEach(p => addEvent(p.dueDate, { label: `${d.title} — ${p.name}`, status: p.status, priority: d.priority, department: d.department, waitingOn: p.waitingOn }));
+    else addEvent(d.dueDate, { label: d.title, status: d.status, priority: d.priority, department: d.department, waitingOn: null });
+  });
+
+  const weeklyItems = [];
+  processed.forEach(d => {
+    const phases = d.phases || [];
+    if (phases.length > 0) {
+      phases.forEach(p => {
+        if (((p.dueDate >= weekStart && p.dueDate <= weekEnd) || p.status === "Overdue") && p.status !== "Complete")
+          weeklyItems.push({ type: "phase", deliverable: d, label: `${d.title} — ${p.name}`, dueDate: p.dueDate, status: p.status, priority: d.priority, department: d.department, waitingOn: p.waitingOn || null });
+      });
+    } else {
+      if (((d.dueDate >= weekStart && d.dueDate <= weekEnd) || d.status === "Overdue") && d.status !== "Complete")
+        weeklyItems.push({ type: "deliverable", deliverable: d, label: d.title, dueDate: d.dueDate, status: d.status, priority: d.priority, department: d.department, waitingOn: null });
+    }
+  });
+  weeklyItems.sort((a, b) => {
+    if (a.status === "Overdue" && b.status !== "Overdue") return -1;
+    if (b.status === "Overdue" && a.status !== "Overdue") return 1;
+    const pd = (PRIORITY_ORDER[a.priority] ?? 99) - (PRIORITY_ORDER[b.priority] ?? 99);
+    return pd !== 0 ? pd : (a.dueDate || "9999") < (b.dueDate || "9999") ? -1 : 1;
+  });
+
+  const saveDeliverable = () => {
+    if (!form.title.trim()) return;
+    if (editId !== null) setDeliverables(ds => ds.map(x => x.id === editId ? { ...x, ...form } : x));
+    else                  setDeliverables(ds => [...ds, { ...form, id: Date.now(), phases: [] }]);
+    setEditId(null); setForm(EMPTY_FORM); setShowForm(false);
+  };
+  const startEdit = d => { setForm({ title: d.title, description: d.description, status: d.status, priority: d.priority, dueDate: d.dueDate, notes: d.notes, department: d.department }); setEditId(d.id); setShowForm(true); };
+  const removeDeliverable = id => { setDeliverables(ds => ds.filter(x => x.id !== id)); setConfirmDelete(null); };
+  const toggleExpand = id => setExpanded(e => ({ ...e, [id]: !e[id] }));
+  const openPhaseForm = (delivId, idx) => {
+    const d = deliverables.find(x => x.id === delivId);
+    setPhaseData(idx === null ? EMPTY_PHASE : { ...(d.phases[idx] || EMPTY_PHASE) });
+    setPhaseForm({ delivId, phaseIdx: idx });
+  };
+  const savePhase = () => {
+    if (!phaseData.name.trim()) return;
+    setDeliverables(ds => ds.map(d => {
+      if (d.id !== phaseForm.delivId) return d;
+      const phases = [...(d.phases || [])];
+      phaseForm.phaseIdx === null ? phases.push({ ...phaseData, id: Date.now() }) : (phases[phaseForm.phaseIdx] = { ...phases[phaseForm.phaseIdx], ...phaseData });
+      return { ...d, phases };
+    }));
+    setPhaseForm(null); setPhaseData(EMPTY_PHASE);
+  };
+  const removePhase    = (delivId, idx) => setDeliverables(ds => ds.map(d => d.id !== delivId ? d : { ...d, phases: (d.phases || []).filter((_, i) => i !== idx) }));
+  const saveNote       = () => { setDayNotes(n => ({ ...n, [selectedISO]: noteText })); setEditingNote(false); };
+  const deleteNote     = () => { setDayNotes(n => { const c = { ...n }; delete c[selectedISO]; return c; }); setEditingNote(false); setNoteText(""); };
+  const setOfficeStatus = (iso, val) => setOfficeDays(o => val === "Out of Office" ? (({ [iso]: _, ...rest }) => rest)(o) : { ...o, [iso]: val });
+
+  const isClassBDay = (iso) => classBContracts.some(c => c.start && c.end && iso >= c.start && iso <= c.end);
+  const getClassBContract = (iso) => classBContracts.find(c => c.start && c.end && iso >= c.start && iso <= c.end) || null;
+  const saveClassBContract = () => {
+    if (!classBForm.start || !classBForm.end || classBForm.start > classBForm.end) return;
+    if (editClassBId !== null) setClassBContracts(cs => cs.map(c => c.id === editClassBId ? { ...c, ...classBForm } : c));
+    else setClassBContracts(cs => [...cs, { ...classBForm, id: Date.now() }]);
+    setShowClassBForm(false); setClassBForm(EMPTY_CLASSB); setEditClassBId(null);
+  };
+  const deleteClassBContract = (id) => setClassBContracts(cs => cs.filter(c => c.id !== id));
+  const openEditClassB = (c) => { setClassBForm({ label: c.label, start: c.start, end: c.end, tdPerDiem: !!c.tdPerDiem, mealDays: c.mealDays||[], mealBreakfast: c.mealBreakfast!==false, mealLunch: c.mealLunch!==false, mealDinner: c.mealDinner!==false, fieldDays: c.fieldDays||0, instructorPostedToSchool: !!c.instructorPostedToSchool, instructorDuty: !!c.instructorDuty }); setEditClassBId(c.id); setShowClassBForm(true); };
+
+  // Recurring duties helpers
+  const getRecurringForDay = (iso) => {
+    if (!iso) return [];
+    const dt = new Date(iso + "T00:00:00");
+    const dow = dt.getDay();
+    return recurringDuties.filter(r => r.daysOfWeek.includes(dow) && (!r.startDate || iso >= r.startDate) && (!r.endDate || iso <= r.endDate));
+  };
+  const saveRecurring = () => {
+    if (!recurringForm.label.trim() || recurringForm.daysOfWeek.length === 0) return;
+    if (editRecurringId !== null) setRecurringDuties(rs => rs.map(r => r.id === editRecurringId ? { ...r, ...recurringForm } : r));
+    else setRecurringDuties(rs => [...rs, { ...recurringForm, id: Date.now() }]);
+    setShowRecurringForm(false); setRecurringForm(EMPTY_RECURRING); setEditRecurringId(null);
+  };
+  const deleteRecurring = (id) => setRecurringDuties(rs => rs.filter(r => r.id !== id));
+  const openEditRecurring = (r) => { setRecurringForm({ label: r.label, daysOfWeek: r.daysOfWeek, startDate: r.startDate||"", endDate: r.endDate||"", badge: r.badge||"⚓", color: r.color||"#8aafc8" }); setEditRecurringId(r.id); setShowRecurringForm(true); };
+
+  // YTD earnings calculator
+  const calcYTD = (year) => {
+    const DAILY = 199.65, HALF = 108.07, CLASSB_DAILY = 183.16, NET_RATE = 0.69;
+    const months = [];
+    let ytdGross = 0, ytdNet = 0, ytdTaxFree = 0;
+    for (let m = 0; m < 12; m++) {
+      const prefix = `${year}-${String(m+1).padStart(2,"0")}`;
+      const lastDay = new Date(year, m+1, 0).getDate();
+      let gross = 0, classADays = 0, classBDays = 0;
+      for (let d = 1; d <= lastDay; d++) {
+        const iso = `${prefix}-${String(d).padStart(2,"0")}`;
+        if (isClassBDay(iso)) { gross += CLASSB_DAILY; classBDays++; }
+        else {
+          const v = officeDays[iso];
+          if (v === "Full Day" || v === "Full Plus Day") { gross += DAILY; classADays++; }
+          else if (v === "Half Day") { gross += HALF; classADays += 0.5; }
+          else if (v === "Half-In Half-CTO" || v === "CTO") { gross += DAILY; classADays++; }
+        }
+      }
+      const net = gross * NET_RATE;
+      // Tax-free allowances for this month
+      const monthStart = `${prefix}-01`, monthEnd = `${prefix}-${String(lastDay).padStart(2,"0")}`;
+      const monthContracts = classBContracts.filter(c => c.start <= monthEnd && c.end >= monthStart);
+      let taxFree = 0;
+      monthContracts.forEach(c => {
+        const cs = c.start < monthStart ? monthStart : c.start;
+        const ce = c.end   > monthEnd   ? monthEnd   : c.end;
+        taxFree += calcContractAllowances({ ...c, start: cs, end: ce }).total;
+      });
+      const key = prefix;
+      const stub = payStubs[key] || {};
+      const actualGross = (parseFloat(stub.p1actual)||0) + (parseFloat(stub.p2actual)||0);
+      ytdGross += gross; ytdNet += net; ytdTaxFree += taxFree;
+      if (gross > 0 || actualGross > 0) months.push({ month: m, prefix, gross, net, taxFree, classADays, classBDays, actualGross, variance: actualGross > 0 ? actualGross - gross : null });
+    }
+    return { months, ytdGross, ytdNet, ytdTaxFree };
+  };
+
+  const calcContractAllowances = (c) => {
+    if (!c.start || !c.end || c.start > c.end) return { total: 0, breakdown: [] };
+    const MEAL_B = 24.90, MEAL_L = 25.20, MEAL_D = 61.85, INCIDENTAL = 17.50;
+    const mealRate = (c.mealBreakfast !== false ? MEAL_B : 0) + (c.mealLunch !== false ? MEAL_L : 0) + (c.mealDinner !== false ? MEAL_D : 0);
+    const mealDays = c.mealDays || [];
+    const start = new Date(c.start + "T00:00:00"), end = new Date(c.end + "T00:00:00");
+    let totalDays = 0, mealDayCount = 0;
+    for (let d = new Date(start); d <= end; d.setDate(d.getDate() + 1)) { totalDays++; if (mealDays.includes(d.getDay())) mealDayCount++; }
+    const months = ((end.getFullYear() - start.getFullYear()) * 12 + end.getMonth() - start.getMonth()) + (end.getDate() >= start.getDate() ? 1 : 0);
+    const tdTotal        = c.tdPerDiem ? totalDays * INCIDENTAL : 0;
+    const mealTotal      = mealDayCount * mealRate;
+    const fieldTotal     = (parseInt(c.fieldDays) || 0) * 100;
+    const instrSchool    = c.instructorPostedToSchool ? months * 300 : 0;
+    const instrDuty      = c.instructorDuty ? totalDays * 35 : 0;
+    const total = tdTotal + mealTotal + fieldTotal + instrSchool + instrDuty;
+    const breakdown = [
+      c.tdPerDiem              && { label: `TD Per Diem (${totalDays} days × $17.50)`,         amount: tdTotal },
+      mealDayCount > 0         && { label: `Meals (${mealDayCount} days × $${mealRate.toFixed(2)})`, amount: mealTotal },
+      fieldTotal > 0           && { label: `Field Days (${c.fieldDays} × $100.00)`,            amount: fieldTotal },
+      c.instructorPostedToSchool && { label: `Instructor – Posted to School (${months} mo × $300)`, amount: instrSchool },
+      c.instructorDuty         && { label: `Instructor – Duty (${totalDays} days × $35.00)`,   amount: instrDuty },
+    ].filter(Boolean);
+    return { total, totalDays, mealDayCount, tdTotal, mealTotal, fieldTotal, instrSchool, instrDuty, breakdown };
+  };
+
+  const calYear     = calDate.getFullYear();
+  const calMonth    = calDate.getMonth();
+  const firstDay    = new Date(calYear, calMonth, 1).getDay();
+  const daysInMonth = new Date(calYear, calMonth + 1, 0).getDate();
+  const prevMonth   = () => setCalDate(d => new Date(d.getFullYear(), d.getMonth() - 1, 1));
+  const nextMonth   = () => setCalDate(d => new Date(d.getFullYear(), d.getMonth() + 1, 1));
+  const goToday     = () => { setCalDate(new Date()); setSelectedDay(null); };
+  const padded = Array(firstDay).fill(null).concat(Array.from({ length: daysInMonth }, (_, i) => i + 1));
+  while (padded.length % 7 !== 0) padded.push(null);
+  const isoForDay = day => day ? `${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(day).padStart(2,"0")}` : null;
+  const selectedISO    = selectedDay ? isoForDay(selectedDay) : null;
+  const selectedEvents = selectedISO ? (calEvents[selectedISO] || []) : [];
+
+  const thStyle      = { color: C.gold, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, padding: "12px 16px", textAlign: "left" };
+  const btnPrimary   = disabled => ({ background: disabled ? "#5a4a1a" : C.gold, color: C.bg, border: "none", borderRadius: 6, padding: "9px 24px", cursor: disabled ? "default" : "pointer", fontWeight: 700, fontSize: 14 });
+  const btnSecondary = { background: C.surface, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 6, padding: "9px 20px", cursor: "pointer", fontWeight: 600, fontSize: 14 };
+  const btnEdit      = { background: C.surfaceDeep, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 5, padding: "5px 12px", cursor: "pointer", fontSize: 12 };
+  const btnDanger    = { background: "#3a1a1a", color: "#f87171", border: "none", borderRadius: 5, padding: "5px 12px", cursor: "pointer", fontSize: 12 };
+  const toggleBtn    = active => ({ background: active ? C.gold : C.surfaceDeep, color: active ? C.bg : C.blue, border: `1px solid ${active ? C.gold : C.border}`, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontWeight: 700 });
+
+  return (
+    <div style={{ background: C.bg, minHeight: "100vh", fontFamily: "'Segoe UI', system-ui, sans-serif" }}>
+
+      {/* ── Header ── */}
+      <div style={{ background: `linear-gradient(135deg, ${C.bg} 0%, #1a3a5c 100%)`, borderBottom: `3px solid ${C.gold}`, padding: "20px 28px" }}>
+        <div style={{ display: "flex", alignItems: "center", maxWidth: 1200, margin: "0 auto" }}>
+          <div>
+            <div style={{ color: C.gold, fontSize: 10, letterSpacing: 4, fontWeight: 700, textTransform: "uppercase", marginBottom: 4 }}>Her Majesty's Canadian Ship</div>
+            <div style={{ color: "#fff", fontSize: 26, fontWeight: 800, letterSpacing: 1, lineHeight: 1 }}>Brunswicker</div>
+            <div style={{ color: C.blue, fontSize: 11, letterSpacing: 2, fontStyle: "italic", marginTop: 4 }}>Pacis Tuendae Causa &nbsp;·&nbsp; Deliverable Tracker</div>
+          </div>
+          <div style={{ marginLeft: "auto", textAlign: "right" }}>
+            <div style={{ color: C.gold, fontSize: 14, fontWeight: 700 }}>Acting Sub-Lieutenant Dion</div>
+            <div style={{ color: C.blue, fontSize: 11, marginTop: 4 }}>Assistant Deck Officer</div>
+          </div>
+        </div>
+        <div style={{ maxWidth: 1200, margin: "14px auto 0", borderTop: `1px solid ${C.border}`, paddingTop: 4, display: "flex", gap: 4 }}>
+          <TabBtn id="tracker"   label="📋 Deliverables"  active={tab === "tracker"}   onClick={setTab} />
+          <TabBtn id="dashboard" label={`🎯 Priority${(stats.urgent + stats.overdue) > 0 ? ` (${stats.urgent + stats.overdue})` : ""}`} active={tab === "dashboard"} onClick={setTab} />
+          <TabBtn id="weekly"    label={`📅 Weekly${weeklyItems.length > 0 ? ` (${weeklyItems.length})` : ""}`} active={tab === "weekly"}    onClick={setTab} />
+          <TabBtn id="calendar"  label="🗓 Calendar"       active={tab === "calendar"}  onClick={setTab} />
+          <TabBtn id="journal"   label="📓 Journal"        active={tab === "journal"}   onClick={setTab} />
+        </div>
+      </div>
+
+      {/* ════════ TRACKER TAB ════════ */}
+      {tab === "tracker" && (
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 20px" }}>
+
+          {/* Stats */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(160px, 1fr))", gap: 14, marginBottom: 28 }}>
+            {[
+              { label: "Total",         value: stats.total,      color: C.blue },
+              { label: "In Progress",   value: stats.inProgress, color: "#facc15" },
+              { label: "Complete",      value: stats.complete,   color: "#4ade80" },
+              { label: "Overdue",       value: stats.overdue,    color: "#f87171" },
+              { label: "Urgent (Open)", value: stats.urgent,     color: "#fb923c" },
+            ].map(s => (
+              <div key={s.label} style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: "16px 20px" }}>
+                <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 8 }}>{s.label}</div>
+                <div style={{ color: s.color, fontSize: 34, fontWeight: 800, lineHeight: 1 }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Filter bar */}
+          <div style={{ display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center", marginBottom: 18, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: "12px 16px" }}>
+            <button onClick={() => { setShowForm(true); setEditId(null); setForm(EMPTY_FORM); }}
+              style={{ background: C.gold, color: C.bg, border: "none", borderRadius: 6, padding: "8px 18px", fontWeight: 700, cursor: "pointer", fontSize: 13 }}>
+              + Add Deliverable
+            </button>
+            <div style={{ width: 1, height: 22, background: C.border }} />
+            <span style={{ color: C.muted, fontSize: 12 }}>Filter:</span>
+            {[
+              { val: filterStatus,   set: setFilterStatus,   opts: STATUSES,   ph: "All Statuses" },
+              { val: filterPriority, set: setFilterPriority, opts: PRIORITIES, ph: "All Priorities" },
+            ].map((f, i) => (
+              <select key={i} value={f.val} onChange={e => f.set(e.target.value)} style={{ background: C.surfaceDeep, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12 }}>
+                <option value="All">{f.ph}</option>
+                {f.opts.map(o => <option key={o}>{o}</option>)}
+              </select>
+            ))}
+            <div style={{ width: 1, height: 22, background: C.border }} />
+            <span style={{ color: C.muted, fontSize: 12 }}>Sort:</span>
+            <select value={sortField} onChange={e => setSortField(e.target.value)} style={{ background: C.surfaceDeep, color: C.text, border: `1px solid ${C.border}`, borderRadius: 6, padding: "6px 10px", fontSize: 12 }}>
+              <option value="dueDate">Due Date</option>
+              <option value="priority">Priority</option>
+              <option value="title">Title</option>
+            </select>
+            <div style={{ width: 1, height: 22, background: C.border }} />
+            <button onClick={() => setShowRelevant(r => !r)} style={toggleBtn(showRelevant)}>📅 Relevant This Week</button>
+            <button onClick={() => setGroupByDept(g => !g)}  style={toggleBtn(groupByDept)}>🗂 Group by Dept</button>
+            <span style={{ color: C.faint, fontSize: 12, marginLeft: "auto" }}>{filtered.length} of {stats.total} item{stats.total !== 1 ? "s" : ""}</span>
+          </div>
+
+          {/* Table */}
+          <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+            {tableRows.length === 0 ? (
+              <div style={{ color: C.faint, textAlign: "center", padding: 52, fontSize: 14 }}>
+                {stats.total === 0 ? "No deliverables yet — click '+ Add Deliverable' to get started." : "No deliverables match the current filters."}
+              </div>
+            ) : (
+              <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                <thead>
+                  <tr style={{ background: C.surfaceDeep, borderBottom: `2px solid ${C.border}` }}>
+                    {["", "Title / Description", "Department", "Status", "Priority", "Due Date", "Notes", "Actions"].map(h => <th key={h} style={thStyle}>{h}</th>)}
+                  </tr>
+                </thead>
+                <tbody>
+                  {tableRows.map((d, i) => {
+                    if (d._isHeader) return (
+                      <tr key={`hdr-${d.dept}`}>
+                        <td colSpan={8} style={{ padding: "10px 18px", background: C.surfaceDeep, borderTop: i > 0 ? `2px solid ${C.border}` : "none", borderBottom: `1px solid ${C.border}` }}>
+                          <span style={{ color: C.gold, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5 }}>{d.dept}</span>
+                          <span style={{ color: C.faint, fontSize: 11, marginLeft: 8 }}>— {d.count} item{d.count !== 1 ? "s" : ""}</span>
+                        </td>
+                      </tr>
+                    );
+
+                    const row    = ROW_BG[d.status] || {};
+                    const isOpen = expanded[d.id];
+                    const phases = d.phases || [];
+                    return [
+                      <tr key={d.id} style={{ borderBottom: isOpen ? "none" : `1px solid ${C.border}`, background: row.bg || (i % 2 === 0 ? C.surface : C.surfaceAlt), borderLeft: `4px solid ${row.border || "transparent"}` }}>
+                        <td style={{ padding: "10px 10px 10px 14px", width: 32 }}>
+                          <button onClick={() => toggleExpand(d.id)} style={{ background: "none", border: `1px solid ${C.border}`, borderRadius: 4, color: C.blue, cursor: "pointer", width: 26, height: 26, fontSize: 10, display: "flex", alignItems: "center", justifyContent: "center" }}>
+                            {isOpen ? "▲" : "▼"}
+                          </button>
+                        </td>
+                        <td style={{ padding: "12px 16px", maxWidth: 220 }}>
+                          <div style={{ color: C.text, fontWeight: 600, fontSize: 14 }}>{d.title}</div>
+                          {d.description && <div style={{ color: C.muted, fontSize: 12, marginTop: 3 }}>{d.description}</div>}
+                          {phases.length > 0 && <div style={{ color: C.faint, fontSize: 11, marginTop: 4 }}>{phases.length} phase{phases.length !== 1 ? "s" : ""}</div>}
+                        </td>
+                        <td style={{ padding: "12px 16px" }}>{d.department ? <Badge label={d.department} colorClass={DEPT_COLORS[d.department] || "bg-gray-200 text-gray-800"} /> : <span style={{ color: C.faint }}>—</span>}</td>
+                        <td style={{ padding: "12px 16px" }}><Badge label={d.status}   colorClass={STATUS_COLORS[d.status]} /></td>
+                        <td style={{ padding: "12px 16px" }}><Badge label={d.priority} colorClass={PRIORITY_COLORS[d.priority]} /></td>
+                        <td style={{ padding: "12px 16px", color: d.status === "Overdue" ? "#f87171" : C.blue, fontSize: 13, whiteSpace: "nowrap" }}>{fmtDate(d.dueDate)}</td>
+                        <td style={{ padding: "12px 16px", color: C.muted, fontSize: 12, maxWidth: 180 }}>
+                          <div style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.notes || "—"}</div>
+                        </td>
+                        <td style={{ padding: "12px 16px", whiteSpace: "nowrap" }}>
+                          <button onClick={() => startEdit(d)}           style={{ ...btnEdit, marginRight: 6 }}>Edit</button>
+                          <button onClick={() => setConfirmDelete(d.id)} style={btnDanger}>Delete</button>
+                        </td>
+                      </tr>,
+                      isOpen && (
+                        <tr key={`${d.id}-ph`} style={{ borderBottom: `1px solid ${C.border}` }}>
+                          <td colSpan={8} style={{ padding: "0 16px 14px 56px", background: row.bg || C.surfaceDeep }}>
+                            <div style={{ background: C.bg, border: `1px solid ${C.border}`, borderRadius: 8, overflow: "hidden", marginTop: 8 }}>
+                              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "10px 16px", background: C.surfaceDeep, borderBottom: `1px solid ${C.border}` }}>
+                                <span style={{ color: C.gold, fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.2 }}>Phases</span>
+                                <button onClick={() => openPhaseForm(d.id, null)} style={{ background: C.surfaceDeep, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 5, padding: "4px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>+ Add Phase</button>
+                              </div>
+                              {phases.length === 0 ? (
+                                <div style={{ color: C.faint, padding: "14px 16px", fontSize: 13 }}>No phases yet — click "+ Add Phase" to break this deliverable into steps.</div>
+                              ) : (
+                                <table style={{ width: "100%", borderCollapse: "collapse" }}>
+                                  <thead>
+                                    <tr style={{ background: C.surfaceDeep }}>
+                                      {["Phase Name","Status","Due Date","Waiting On",""].map(h => <th key={h} style={{ ...thStyle, color: C.muted, fontSize: 10, padding: "8px 16px" }}>{h}</th>)}
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {phases.map((p, pi) => {
+                                      const pr = ROW_BG[p.status] || {};
+                                      return (
+                                        <tr key={pi} style={{ borderTop: `1px solid ${C.border}`, background: pr.bg || "transparent", borderLeft: `3px solid ${pr.border || "transparent"}` }}>
+                                          <td style={{ padding: "8px 16px", color: C.text, fontSize: 13 }}>{p.name}</td>
+                                          <td style={{ padding: "8px 16px" }}><Badge label={p.status} colorClass={STATUS_COLORS[p.status]} /></td>
+                                          <td style={{ padding: "8px 16px", color: p.status === "Overdue" ? "#f87171" : C.blue, fontSize: 12, whiteSpace: "nowrap" }}>{fmtDate(p.dueDate)}</td>
+                                          <td style={{ padding: "8px 16px", fontSize: 12 }}>{p.waitingOn ? <span style={{ color: "#fb923c" }}>⏳ {p.waitingOn}</span> : <span style={{ color: C.faint }}>—</span>}</td>
+                                          <td style={{ padding: "8px 16px", whiteSpace: "nowrap" }}>
+                                            <button onClick={() => openPhaseForm(d.id, pi)} style={{ ...btnEdit, fontSize: 11, padding: "3px 10px", marginRight: 4 }}>Edit</button>
+                                            <button onClick={() => removePhase(d.id, pi)}   style={{ ...btnDanger, fontSize: 11, padding: "3px 10px" }}>Remove</button>
+                                          </td>
+                                        </tr>
+                                      );
+                                    })}
+                                  </tbody>
+                                </table>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      )
+                    ];
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* ════════ PRIORITY DASHBOARD TAB ════════ */}
+      {tab === "dashboard" && (
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 20px" }}>
+          <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 2, fontWeight: 700, marginBottom: 18 }}>Priority Situation Report — {new Date().toLocaleDateString("en-CA", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</div>
+
+          {/* Urgent + Overdue quick counts */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 14, marginBottom: 28 }}>
+            {[
+              { label: "🔴 Overdue",          value: stats.overdue,                                                              color: "#f87171", bg: "#3a0f0f" },
+              { label: "🟠 Urgent (Open)",     value: stats.urgent,                                                              color: "#fb923c", bg: "#3a1a0f" },
+              { label: "⏳ Blocked",           value: processed.flatMap(d => (d.phases||[]).filter(p => p.waitingOn)).length +
+                                                      processed.filter(d => !(d.phases||[]).length).length * 0,                  color: "#facc15", bg: "#2a2200" },
+              { label: "✅ Complete",           value: stats.complete,                                                             color: "#4ade80", bg: "#0f2e1a" },
+              { label: "📋 Total Open",        value: stats.total - stats.complete,                                              color: C.blue,    bg: C.surface },
+            ].map(s => (
+              <div key={s.label} style={{ background: s.bg, border: `1px solid ${C.border}`, borderRadius: 10, padding: "16px 20px" }}>
+                <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 8 }}>{s.label}</div>
+                <div style={{ color: s.color, fontSize: 34, fontWeight: 800, lineHeight: 1 }}>{s.value}</div>
+              </div>
+            ))}
+          </div>
+
+          {/* Overdue items */}
+          {processed.filter(d => d.status === "Overdue" || (d.phases||[]).some(p => p.status === "Overdue")).length > 0 && (
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ color: "#f87171", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 10 }}>⚠ Overdue</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {processed.filter(d => d.status === "Overdue" || (d.phases||[]).some(p => p.status === "Overdue")).map(d => {
+                  const overduePhs = (d.phases||[]).filter(p => p.status === "Overdue");
+                  return (
+                    <div key={d.id} style={{ background: "#3a0f0f", border: "1px solid #f87171", borderLeft: "5px solid #f87171", borderRadius: 10, padding: "14px 20px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                        <div style={{ flex: 1 }}>
+                          <div style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{d.title}</div>
+                          <div style={{ color: C.faint, fontSize: 11, marginTop: 2 }}>{d.department || "No department"} · Due {fmtDate(d.dueDate)}</div>
+                          {overduePhs.length > 0 && <div style={{ color: "#f87171", fontSize: 11, marginTop: 4 }}>Phases overdue: {overduePhs.map(p => p.name).join(", ")}</div>}
+                        </div>
+                        <div style={{ display: "flex", gap: 6 }}>
+                          <Badge label={d.priority} colorClass={PRIORITY_COLORS[d.priority]} />
+                          <button onClick={() => { startEdit(d); setTab("tracker"); }} style={{ ...btnEdit, fontSize: 11 }}>Edit</button>
+                        </div>
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* Urgent (non-complete) items */}
+          {processed.filter(d => d.priority === "Urgent" && d.status !== "Complete" && d.status !== "Overdue").length > 0 && (
+            <div style={{ marginBottom: 24 }}>
+              <div style={{ color: "#fb923c", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 10 }}>🟠 Urgent — In Progress</div>
+              <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                {processed.filter(d => d.priority === "Urgent" && d.status !== "Complete" && d.status !== "Overdue").map(d => (
+                  <div key={d.id} style={{ background: "#3a1a0f", border: "1px solid #fb923c", borderLeft: "5px solid #fb923c", borderRadius: 10, padding: "14px 20px", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{d.title}</div>
+                      <div style={{ color: C.faint, fontSize: 11, marginTop: 2 }}>{d.department || "No department"} · Due {fmtDate(d.dueDate)}</div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <Badge label={d.status} colorClass={STATUS_COLORS[d.status]} />
+                      <button onClick={() => { startEdit(d); setTab("tracker"); }} style={{ ...btnEdit, fontSize: 11 }}>Edit</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Blocked items (waiting on someone) */}
+          {(() => {
+            const blocked = [];
+            processed.forEach(d => {
+              (d.phases||[]).forEach(p => { if (p.waitingOn && p.status !== "Complete") blocked.push({ d, p }); });
+            });
+            return blocked.length > 0 ? (
+              <div style={{ marginBottom: 24 }}>
+                <div style={{ color: "#facc15", fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 10 }}>⏳ Blocked — Waiting On Others</div>
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  {blocked.map(({ d, p }, i) => (
+                    <div key={i} style={{ background: "#2a2200", border: "1px solid #facc15", borderLeft: "5px solid #facc15", borderRadius: 10, padding: "14px 20px", display: "flex", alignItems: "center", gap: 12, flexWrap: "wrap" }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{d.title} — <span style={{ color: "#facc15" }}>{p.name}</span></div>
+                        <div style={{ color: "#facc15", fontSize: 12, marginTop: 2 }}>Waiting on: <strong>{p.waitingOn}</strong></div>
+                      </div>
+                      <Badge label={p.status} colorClass={STATUS_COLORS[p.status]} />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ) : null;
+          })()}
+
+          {/* By department breakdown */}
+          <div>
+            <div style={{ color: C.gold, fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 10 }}>📦 By Department</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(260px, 1fr))", gap: 12 }}>
+              {DEPARTMENTS.map(dept => {
+                const items = processed.filter(d => d.department === dept && d.status !== "Complete");
+                if (!items.length) return null;
+                const overdue = items.filter(d => d.status === "Overdue").length;
+                const urgent  = items.filter(d => d.priority === "Urgent").length;
+                return (
+                  <div key={dept} style={{ background: C.surface, border: `1px solid ${overdue > 0 ? "#f87171" : urgent > 0 ? "#fb923c" : C.border}`, borderRadius: 10, padding: "14px 16px" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
+                      <div style={{ color: C.gold, fontWeight: 700, fontSize: 13 }}>{dept}</div>
+                      <div style={{ display: "flex", gap: 6 }}>
+                        {overdue > 0 && <span style={{ background: "#3a0f0f", color: "#f87171", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4 }}>{overdue} OVR</span>}
+                        {urgent  > 0 && <span style={{ background: "#3a1a0f", color: "#fb923c", fontSize: 10, fontWeight: 700, padding: "2px 7px", borderRadius: 4 }}>{urgent} URG</span>}
+                        <span style={{ color: C.faint, fontSize: 11 }}>{items.length} open</span>
+                      </div>
+                    </div>
+                    {items.slice(0,4).map(d => (
+                      <div key={d.id} style={{ borderTop: `1px solid ${C.border}`, padding: "7px 0", display: "flex", alignItems: "center", gap: 8 }}>
+                        <div style={{ width: 8, height: 8, borderRadius: "50%", background: d.status === "Overdue" ? "#f87171" : d.priority === "Urgent" ? "#fb923c" : C.blue, flexShrink: 0 }} />
+                        <div style={{ flex: 1, color: C.text, fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{d.title}</div>
+                        <div style={{ color: C.faint, fontSize: 11, flexShrink: 0 }}>{fmtDate(d.dueDate)}</div>
+                      </div>
+                    ))}
+                    {items.length > 4 && <div style={{ color: C.faint, fontSize: 11, marginTop: 6 }}>+ {items.length - 4} more…</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {processed.filter(d => d.status !== "Complete").length === 0 && (
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 52, textAlign: "center", color: "#4ade80", fontSize: 15, fontWeight: 700 }}>All clear — no open deliverables. ⚓</div>
+          )}
+        </div>
+      )}
+
+      {/* ════════ WEEKLY OUTLOOK TAB ════════ */}
+      {tab === "weekly" && (
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 20px" }}>
+          <div style={{ marginBottom: 24 }}>
+            <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 2, fontWeight: 700, marginBottom: 4 }}>Week of</div>
+            <div style={{ color: C.text, fontSize: 18, fontWeight: 800 }}>{fmtDate(weekStart)} — {fmtDate(weekEnd)}</div>
+          </div>
+          {weeklyItems.length === 0 ? (
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: 52, textAlign: "center", color: C.faint, fontSize: 14 }}>Nothing due this week — clear skies ahead. ⚓</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {weeklyItems.map((it, i) => {
+                const row = ROW_BG[it.status] || {};
+                return (
+                  <div key={i} style={{ background: row.bg || C.surface, border: `1px solid ${C.border}`, borderLeft: `5px solid ${row.border || (it.priority === "Urgent" ? "#fb923c" : C.border)}`, borderRadius: 10, padding: "14px 20px" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                      <div style={{ minWidth: 28, height: 28, borderRadius: "50%", background: C.bg, border: `1px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "center", color: C.gold, fontSize: 12, fontWeight: 800, flexShrink: 0 }}>{i + 1}</div>
+                      <div style={{ flex: 1, minWidth: 160 }}>
+                        <div style={{ color: C.text, fontWeight: 700, fontSize: 14 }}>{it.label}</div>
+                        <div style={{ color: C.faint, fontSize: 11, marginTop: 3 }}>{it.type === "phase" ? "Phase" : "Deliverable"}{it.department ? ` · ${it.department}` : ""}</div>
+                      </div>
+                      <div style={{ display: "flex", gap: 6, alignItems: "center", flexWrap: "wrap" }}>
+                        <Badge label={it.status}   colorClass={STATUS_COLORS[it.status]} />
+                        <Badge label={it.priority} colorClass={PRIORITY_COLORS[it.priority]} />
+                        {it.department && <Badge label={it.department} colorClass={DEPT_COLORS[it.department] || "bg-gray-200 text-gray-800"} />}
+                      </div>
+                      <div style={{ color: it.status === "Overdue" ? "#f87171" : C.blue, fontSize: 12, fontWeight: it.status === "Overdue" ? 700 : 400, whiteSpace: "nowrap" }}>
+                        {it.status === "Overdue" ? "⚠ OVERDUE" : `Due ${fmtDay(it.dueDate)}`}
+                      </div>
+                    </div>
+                    {it.waitingOn && <div style={{ marginTop: 8, paddingLeft: 42, color: "#fb923c", fontSize: 12 }}>⏳ Tentative — waiting on: <strong>{it.waitingOn}</strong></div>}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ════════ CALENDAR TAB ════════ */}
+      {tab === "calendar" && (() => {
+        const monthPrefix = `${calYear}-${String(calMonth+1).padStart(2,"0")}-`;
+        const daysWorked = Object.entries(officeDays)
+          .filter(([k]) => k.startsWith(monthPrefix))
+          .reduce((sum, [, v]) => sum + (v === "Full Day" || v === "Full Plus Day" || v === "Half-In Half-CTO" ? 1 : v === "Half Day" ? 0.5 : 0), 0);
+        return (
+        <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 20px" }}>
+          <div style={{ display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-start" }}>
+            <div style={{ flex: "1 1 560px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "16px 20px", background: C.surfaceDeep, borderBottom: `2px solid ${C.border}` }}>
+                <button onClick={prevMonth} style={{ background: "none", border: `1px solid ${C.border}`, color: C.blue, borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 16, fontWeight: 700 }}>‹</button>
+                <div style={{ textAlign: "center" }}>
+                  <div style={{ color: C.gold, fontSize: 16, fontWeight: 800, letterSpacing: 1 }}>{MONTH_NAMES[calMonth]} {calYear}</div>
+                  <div style={{ marginTop: 4, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                    <span style={{ color: C.faint, fontSize: 11 }}>Days worked:</span>
+                    <span style={{ color: daysWorked >= 16 ? "#f87171" : daysWorked >= 13.5 ? "#facc15" : daysWorked > 0 ? "#4ade80" : C.faint, fontSize: 13, fontWeight: 800 }}>{daysWorked % 1 === 0 ? daysWorked : daysWorked.toFixed(1)}</span>
+                  </div>
+                  {daysWorked > 16 && (
+                    <div style={{ marginTop: 4, color: "#f87171", fontSize: 10, fontWeight: 700, letterSpacing: 0.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                      ⚠ Exceeding Class A monthly limit
+                    </div>
+                  )}
+                  {daysWorked === 16 && (
+                    <div style={{ marginTop: 4, color: "#f87171", fontSize: 10, fontWeight: 700, letterSpacing: 0.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                      ⚠ Reached Class A monthly limit
+                    </div>
+                  )}
+                  {daysWorked >= 13.5 && daysWorked < 16 && (
+                    <div style={{ marginTop: 4, color: "#facc15", fontSize: 10, fontWeight: 700, letterSpacing: 0.5, display: "flex", alignItems: "center", justifyContent: "center", gap: 4 }}>
+                      ⚠ Approaching Class A monthly limit
+                    </div>
+                  )}
+                </div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={goToday}   style={{ background: "none", border: `1px solid ${C.border}`, color: C.blue, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontSize: 12, fontWeight: 600 }}>Today</button>
+                  <button onClick={nextMonth} style={{ background: "none", border: `1px solid ${C.border}`, color: C.blue, borderRadius: 6, padding: "6px 14px", cursor: "pointer", fontSize: 16, fontWeight: 700 }}>›</button>
+                </div>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)", borderBottom: `1px solid ${C.border}` }}>
+                {DAY_NAMES.map(d => <div key={d} style={{ textAlign: "center", padding: "10px 0", color: C.faint, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>{d}</div>)}
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(7, 1fr)" }}>
+                {padded.map((day, idx) => {
+                  const iso      = isoForDay(day);
+                  const events   = day ? (calEvents[iso] || []) : [];
+                  const isToday  = iso === today;
+                  const isSel    = iso === selectedISO;
+                  const isWeekend = idx % 7 === 0 || idx % 7 === 6;
+                  const hasNote  = !!(dayNotes[iso]);
+                  const officeVal = officeDays[iso] || "Out of Office";
+                  const officeInfo = OFFICE_STATUSES[officeVal] || OFFICE_STATUSES["Out of Office"];
+                  const inOffice = officeVal !== "Out of Office";
+                  const classBActive = day ? isClassBDay(iso) : false;
+                  const cellBg = isSel ? "#1a3a5c"
+                    : officeInfo.splitBg ? `linear-gradient(to bottom, ${officeInfo.splitTop} 50%, ${officeInfo.splitBot} 50%)`
+                    : officeInfo.halfBg  ? `linear-gradient(to bottom, ${officeInfo.bg} 50%, ${isWeekend && day ? "#0c1c30" : C.bg} 50%)`
+                    : officeInfo.bg      ? officeInfo.bg
+                    : isWeekend && day   ? "#0c1c30" : C.bg;                  return (
+                    <div key={idx}
+                      onClick={() => { if (day) { setSelectedDay(isSel ? null : day); setEditingNote(false); setNoteText(""); } }}
+                      style={{ height: 90, padding: "8px 6px", borderRight: `1px solid ${C.border}`, borderBottom: `1px solid ${C.border}`, background: cellBg, cursor: day ? "pointer" : "default", outline: isSel ? `2px solid ${C.gold}` : classBActive ? `2px solid #a78bfa` : "none", overflow: "hidden", boxSizing: "border-box" }}>
+                      {day && (
+                        <>
+                          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 2 }}>
+                            <div style={{ width: 26, height: 26, borderRadius: "50%", display: "flex", alignItems: "center", justifyContent: "center", background: isToday ? C.gold : "transparent", color: isToday ? C.bg : C.text, fontSize: 13, fontWeight: isToday ? 800 : 500, flexShrink: 0 }}>{day}</div>
+                            <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+                              {classBActive && <div style={{ fontSize: 9, color: "#a78bfa", fontWeight: 700 }}>B</div>}
+                              {inOffice && <div style={{ fontSize: 9, color: officeInfo.color, fontWeight: 700 }}>{officeInfo.abbr}</div>}
+                            </div>
+                          </div>
+                          {day && (() => {
+                            const recs = getRecurringForDay(iso);
+                            return recs.length > 0 ? (
+                              <div style={{ display: "flex", flexWrap: "wrap", gap: 1, marginTop: 1 }}>
+                                {recs.map(r => <span key={r.id} title={r.label} style={{ fontSize: 10, color: r.color || C.blue }}>{r.badge || "⚓"}</span>)}
+                              </div>
+                            ) : null;
+                          })()}
+                          {hasNote && <div style={{ fontSize: 9, color: C.gold, paddingLeft: 2, marginBottom: 2 }}>📝</div>}
+                          <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
+                            {events.slice(0, 3).map((ev, ei) => (
+                              <div key={ei} style={{ fontSize: 10, lineHeight: 1.3, padding: "2px 5px", borderRadius: 3, background: CAL_COLORS[ev.status] + "30", borderLeft: `2px solid ${CAL_COLORS[ev.status]}`, color: CAL_COLORS[ev.status], overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{ev.label}</div>
+                            ))}
+                            {events.length > 3 && <div style={{ fontSize: 10, color: C.faint, paddingLeft: 4 }}>+{events.length - 3} more</div>}
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+
+            <div style={{ flex: "0 0 300px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden", minHeight: 300 }}>
+              {selectedDay ? (
+                <>
+                  <div style={{ padding: "14px 18px", background: C.surfaceDeep, borderBottom: `1px solid ${C.border}` }}>
+                    <div style={{ color: C.gold, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700, marginBottom: 2 }}>Selected Date</div>
+                    <div style={{ color: C.text, fontSize: 16, fontWeight: 800 }}>{fmtDate(selectedISO)}</div>
+                  </div>
+                  <div style={{ padding: "12px 18px", borderBottom: `1px solid ${C.border}`, background: OFFICE_STATUSES[officeDays[selectedISO] || "Out of Office"]?.bg || "#0c1820" }}>
+                    <div style={{ color: C.gold, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700, marginBottom: 8 }}>📍 Attendance</div>
+                    <select
+                      value={officeDays[selectedISO] || "Out of Office"}
+                      onChange={e => setOfficeStatus(selectedISO, e.target.value)}
+                      style={{ ...fieldStyle, fontSize: 13, color: OFFICE_STATUSES[officeDays[selectedISO] || "Out of Office"]?.color || C.faint, fontWeight: 700 }}>
+                      {OFFICE_OPTIONS.map(o => <option key={o} value={o}>{OFFICE_STATUSES[o].label}</option>)}
+                    </select>
+                  </div>
+                  <div style={{ padding: "14px 18px", borderBottom: `1px solid ${C.border}`, background: "#0c1e2e" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                      <span style={{ color: C.gold, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700 }}>📝 Day Note</span>
+                      {!editingNote && (
+                        <button onClick={() => { setNoteText(dayNotes[selectedISO] || ""); setEditingNote(true); }}
+                          style={{ background: "none", border: `1px solid ${C.border}`, color: C.blue, borderRadius: 5, padding: "3px 10px", cursor: "pointer", fontSize: 11 }}>
+                          {dayNotes[selectedISO] ? "Edit" : "+ Add"}
+                        </button>
+                      )}
+                    </div>
+                    {editingNote ? (
+                      <div>
+                        <textarea value={noteText} onChange={e => setNoteText(e.target.value)} rows={4} placeholder="Add a note for this day..." style={{ ...fieldStyle, resize: "vertical", fontSize: 13 }} autoFocus />
+                        <div style={{ display: "flex", gap: 6, marginTop: 8 }}>
+                          <button onClick={saveNote} style={{ background: C.gold, color: C.bg, border: "none", borderRadius: 5, padding: "5px 14px", cursor: "pointer", fontWeight: 700, fontSize: 12, flex: 1 }}>Save</button>
+                          <button onClick={() => setEditingNote(false)} style={{ background: C.surfaceDeep, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 5, padding: "5px 10px", cursor: "pointer", fontSize: 12 }}>Cancel</button>
+                          {dayNotes[selectedISO] && <button onClick={deleteNote} style={{ background: "#3a1a1a", color: "#f87171", border: "none", borderRadius: 5, padding: "5px 10px", cursor: "pointer", fontSize: 12 }}>Delete</button>}
+                        </div>
+                      </div>
+                    ) : dayNotes[selectedISO] ? (
+                      <div style={{ color: C.text, fontSize: 13, lineHeight: 1.6, whiteSpace: "pre-wrap" }}>{dayNotes[selectedISO]}</div>
+                    ) : (
+                      <div style={{ color: C.faint, fontSize: 12, fontStyle: "italic" }}>No note for this day.</div>
+                    )}
+                  </div>
+                  {selectedEvents.length === 0 ? (
+                    <div style={{ color: C.faint, padding: "18px", fontSize: 13 }}>No deliverables due on this date.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column" }}>
+                      <div style={{ padding: "10px 18px 6px", color: C.gold, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700 }}>Deliverables Due</div>
+                      {selectedEvents.map((ev, i) => (
+                        <div key={i} style={{ padding: "12px 18px", borderTop: `1px solid ${C.border}`, borderLeft: `4px solid ${CAL_COLORS[ev.status]}` }}>
+                          <div style={{ color: C.text, fontSize: 13, fontWeight: 700, marginBottom: 6 }}>{ev.label}</div>
+                          <div style={{ display: "flex", gap: 5, flexWrap: "wrap" }}>
+                            <Badge label={ev.status}   colorClass={STATUS_COLORS[ev.status]} />
+                            <Badge label={ev.priority} colorClass={PRIORITY_COLORS[ev.priority]} />
+                            {ev.department && <Badge label={ev.department} colorClass={DEPT_COLORS[ev.department] || "bg-gray-200 text-gray-800"} />}
+                          </div>
+                          {ev.waitingOn && <div style={{ color: "#fb923c", fontSize: 11, marginTop: 6 }}>⏳ Waiting on: {ev.waitingOn}</div>}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div style={{ padding: "32px 18px", textAlign: "center" }}>
+                  <div style={{ color: C.faint, fontSize: 13, marginBottom: 8 }}>Select a day to see what's due.</div>
+                  <div style={{ marginTop: 24, textAlign: "left" }}>
+                    <div style={{ color: C.gold, fontSize: 10, textTransform: "uppercase", letterSpacing: 1.5, fontWeight: 700, marginBottom: 10 }}>Status Legend</div>
+                    {Object.entries(CAL_COLORS).map(([status, color]) => (
+                      <div key={status} style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 7 }}>
+                        <div style={{ width: 10, height: 10, borderRadius: 2, background: color, flexShrink: 0 }} />
+                        <span style={{ color: C.muted, fontSize: 12 }}>{status}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* ── Pay Calculator ── */}
+          {(() => {
+            const DAILY = 199.65, HALF = 108.07, CLASSB_DAILY = 183.16, NET_RATE = 0.69;
+
+            // Canadian federal holidays for a given year (approximate)
+            const getFederalHolidays = (y) => {
+              const d = (m, day) => `${y}-${String(m).padStart(2,"0")}-${String(day).padStart(2,"0")}`;
+              const nthMonday = (m, n) => { let dt = new Date(y, m-1, 1); while(dt.getDay() !== 1) dt.setDate(dt.getDate()+1); dt.setDate(dt.getDate()+(n-1)*7); return d(m, dt.getDate()); };
+              const easterSunday = (yr) => { const a=yr%19,b=Math.floor(yr/100),c=yr%100,d2=Math.floor(b/4),e=b%4,f=Math.floor((b+8)/25),g=Math.floor((b-f+1)/3),h=(19*a+b-d2-g+15)%30,i=Math.floor(c/4),k=c%4,l=(32+2*e+2*i-h-k)%7,m2=Math.floor((a+11*h+22*l)/451),month=Math.floor((h+l-7*m2+114)/31),day2=((h+l-7*m2+114)%31)+1; return new Date(yr,month-1,day2); };
+              const easter = easterSunday(y);
+              const goodFriday = new Date(easter); goodFriday.setDate(easter.getDate()-2);
+              const gf = `${y}-${String(goodFriday.getMonth()+1).padStart(2,"0")}-${String(goodFriday.getDate()).padStart(2,"0")}`;
+              let vicDay = new Date(y,4,24); while(vicDay.getDay()!==1) vicDay.setDate(vicDay.getDate()-1);
+              const vic = `${y}-05-${String(vicDay.getDate()).padStart(2,"0")}`;
+              return new Set([d(1,1), gf, vic, d(7,1), nthMonday(8,1), nthMonday(9,1), d(9,30), nthMonday(10,2), d(11,11), d(12,25), d(12,26)]);
+            };
+
+            const isWeekendDay = dt => dt.getDay() === 0 || dt.getDay() === 6;
+            const nearestGovtDayBefore = (isoDate) => {
+              const holidays = getFederalHolidays(parseInt(isoDate.slice(0,4)));
+              let dt = new Date(isoDate + "T00:00:00");
+              while (isWeekendDay(dt) || holidays.has(toISO(dt))) dt.setDate(dt.getDate()-1);
+              return toISO(dt);
+            };
+
+            const lastDayOfMonth = (y2, m2) => new Date(y2, m2+1, 0).getDate();
+            const period1End = `${calYear}-${String(calMonth+1).padStart(2,"0")}-15`;
+            const period2End = `${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(lastDayOfMonth(calYear,calMonth)).padStart(2,"0")}`;
+            const payDate1   = nearestGovtDayBefore(period1End);
+            const payDate2   = nearestGovtDayBefore(period2End);
+
+            const calcPeriod = (startDay, endDay) => {
+              let gross = 0, classBGross = 0, classADays = 0, classBDays = 0;
+              for (let d2 = startDay; d2 <= endDay; d2++) {
+                const iso = `${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(d2).padStart(2,"0")}`;
+                if (isClassBDay(iso)) {
+                  classBGross += CLASSB_DAILY; classBDays += 1;
+                } else {
+                  const v = officeDays[iso];
+                  if (v === "Full Day" || v === "Full Plus Day") { gross += DAILY; classADays += 1; }
+                  else if (v === "Half Day") { gross += HALF; classADays += 0.5; }
+                  else if (v === "Half-In Half-CTO" || v === "CTO") { gross += DAILY; classADays += 1; }
+                }
+              }
+              return { gross: gross + classBGross, classAGross: gross, classBGross, classADays, classBDays, net: (gross + classBGross) * NET_RATE };
+            };
+
+            const p1 = calcPeriod(1, 15);
+            const p2 = calcPeriod(16, lastDayOfMonth(calYear, calMonth));
+            const totalGross = p1.gross + p2.gross;
+            const totalNet   = p1.net   + p2.net;
+            const fmt$ = n => `$${n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}`;
+
+            // Active Class B contracts overlapping this month
+            const monthStart = `${calYear}-${String(calMonth+1).padStart(2,"0")}-01`;
+            const monthEnd   = `${calYear}-${String(calMonth+1).padStart(2,"0")}-${String(lastDayOfMonth(calYear,calMonth)).padStart(2,"0")}`;
+            const activeContracts = classBContracts.filter(c => c.start <= monthEnd && c.end >= monthStart);
+
+            // Tax-free allowances from contracts overlapping this month
+            const monthTaxFreeAllowances = (() => {
+              let total = 0, breakdown = [];
+              activeContracts.forEach(c => {
+                // Clip contract to this month
+                const clippedStart = c.start < monthStart ? monthStart : c.start;
+                const clippedEnd   = c.end   > monthEnd   ? monthEnd   : c.end;
+                const clipped = { ...c, start: clippedStart, end: clippedEnd };
+                const a = calcContractAllowances(clipped);
+                if (a.total > 0) { total += a.total; breakdown.push(...a.breakdown.map(b => ({ ...b, contract: c.label || "Contract" }))); }
+              });
+              return { total, breakdown };
+            })();
+
+            const monthKey = `${calYear}-${String(calMonth+1).padStart(2,"0")}`;
+            const stub = payStubs[monthKey] || {};
+            const setStub = (field, val) => setPayStubs(ps => ({ ...ps, [monthKey]: { ...(ps[monthKey]||{}), [field]: val } }));
+
+            const PeriodCard = ({ label, dateRange, payDate, data, accent, stubKey }) => {
+              const actualRaw = stub[stubKey] || "";
+              const actual = parseFloat(actualRaw) || 0;
+              const variance = actualRaw !== "" ? actual - data.gross : null;
+              return (
+                <div style={{ flex: "1 1 280px", background: C.surfaceDeep, border: `1px solid ${variance !== null && Math.abs(variance) > 0.5 ? (variance > 0 ? "#4ade80" : "#f87171") : C.border}`, borderRadius: 10, overflow: "hidden" }}>
+                  <div style={{ background: C.bg, borderBottom: `1px solid ${C.border}`, padding: "12px 16px", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                    <div>
+                      <div style={{ color: accent, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1 }}>{label}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{dateRange}</div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1 }}>Pay Date</div>
+                      <div style={{ color: C.text, fontSize: 12, fontWeight: 700, marginTop: 2 }}>{fmtDate(payDate)}</div>
+                    </div>
+                  </div>
+                  <div style={{ padding: "14px 16px", display: "flex", flexDirection: "column", gap: 8 }}>
+                    {data.classADays > 0 && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: C.muted, fontSize: 12 }}>Class A days</span>
+                      <span style={{ color: C.text, fontWeight: 700, fontSize: 13 }}>{data.classADays % 1 === 0 ? data.classADays : data.classADays.toFixed(1)} <span style={{ color: C.faint, fontSize: 11 }}>({fmt$(data.classAGross)})</span></span>
+                    </div>}
+                    {data.classBDays > 0 && <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: "#a78bfa", fontSize: 12 }}>Class B days</span>
+                      <span style={{ color: "#a78bfa", fontWeight: 700, fontSize: 13 }}>{data.classBDays} <span style={{ color: C.faint, fontSize: 11 }}>({fmt$(data.classBGross)})</span></span>
+                    </div>}
+                    <div style={{ height: 1, background: C.border }} />
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: C.muted, fontSize: 12 }}>Expected gross</span>
+                      <span style={{ color: C.blue, fontWeight: 700, fontSize: 14 }}>{fmt$(data.gross)}</span>
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ color: C.muted, fontSize: 12 }}>Est. net <span style={{ fontSize: 10, color: C.faint }}>(69%)</span></span>
+                      <span style={{ color: "#4ade80", fontWeight: 800, fontSize: 15 }}>{fmt$(data.net)}</span>
+                    </div>
+                    <div style={{ height: 1, background: C.border }} />
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <span style={{ color: C.faint, fontSize: 11, flexShrink: 0 }}>Actual gross paid</span>
+                      <div style={{ position: "relative", flex: 1 }}>
+                        <span style={{ position: "absolute", left: 8, top: "50%", transform: "translateY(-50%)", color: C.muted, fontSize: 12 }}>$</span>
+                        <input type="number" value={actualRaw} onChange={e => setStub(stubKey, e.target.value)} placeholder="0.00"
+                          style={{ ...fieldStyle, paddingLeft: 18, fontSize: 12 }} />
+                      </div>
+                    </div>
+                    {variance !== null && (
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", background: Math.abs(variance) < 0.5 ? "#0f2e1a" : variance > 0 ? "#0f2e1a" : "#3a0f0f", borderRadius: 6, padding: "6px 10px" }}>
+                        <span style={{ color: C.faint, fontSize: 11 }}>{Math.abs(variance) < 0.5 ? "✅ Matches" : variance > 0 ? "⬆ Overpaid" : "⚠ Underpaid"}</span>
+                        <span style={{ color: Math.abs(variance) < 0.5 ? "#4ade80" : variance > 0 ? "#86efac" : "#f87171", fontWeight: 800, fontSize: 13 }}>
+                          {Math.abs(variance) < 0.5 ? "On target" : `${variance > 0 ? "+" : ""}${fmt$(variance)}`}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              );
+            };
+
+            return (
+              <div style={{ marginTop: 24 }}>
+                {/* Class B Contract Manager */}
+                <div style={{ background: C.surface, border: `1px solid #4c1d95`, borderRadius: 12, overflow: "hidden", marginBottom: 16 }}>
+                  <div style={{ padding: "14px 20px", background: C.surfaceDeep, borderBottom: `2px solid #4c1d95`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <div style={{ color: "#a78bfa", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5 }}>🪖 Class B Contracts</div>
+                      <div style={{ color: C.faint, fontSize: 10, marginTop: 3 }}>{fmt$(CLASSB_DAILY)}/day · paid every calendar day including weekends</div>
+                    </div>
+                    <button onClick={() => { setShowClassBForm(true); setClassBForm(EMPTY_CLASSB); setEditClassBId(null); }}
+                      style={{ background: "#4c1d95", color: "#a78bfa", border: "none", borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontWeight: 700, fontSize: 12 }}>
+                      + Add Contract
+                    </button>
+                  </div>
+                  {classBContracts.length === 0 ? (
+                    <div style={{ color: C.faint, padding: "16px 20px", fontSize: 13, fontStyle: "italic" }}>No Class B contracts — click "+ Add Contract" to add one.</div>
+                  ) : (
+                    <div style={{ display: "flex", flexDirection: "column" }}>
+                      {classBContracts.map((c, i) => {
+                        const days = c.start && c.end ? Math.round((new Date(c.end+"T00:00:00") - new Date(c.start+"T00:00:00")) / 86400000) + 1 : 0;
+                        const isActive = c.start && c.end && toISO(new Date()) >= c.start && toISO(new Date()) <= c.end;
+                        const allowances = calcContractAllowances(c);
+                        return (
+                          <div key={c.id} style={{ borderTop: i > 0 ? `1px solid ${C.border}` : "none", borderLeft: `4px solid ${isActive ? "#a78bfa" : C.border}` }}>
+                            <div style={{ padding: "12px 20px", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap" }}>
+                              <div style={{ flex: 1, minWidth: 160 }}>
+                                <div style={{ color: c.label ? C.text : C.faint, fontWeight: 600, fontSize: 13 }}>{c.label || "Unnamed Contract"}</div>
+                                <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{fmtDate(c.start)} — {fmtDate(c.end)} · {days} day{days !== 1 ? "s" : ""} · {fmt$(days * CLASSB_DAILY)} gross</div>
+                                {allowances.total > 0 && <div style={{ color: "#4ade80", fontSize: 11, marginTop: 2 }}>+ {fmt$(allowances.total)} tax-free allowances</div>}
+                              </div>
+                              {isActive && <span style={{ background: "#4c1d95", color: "#a78bfa", fontSize: 10, fontWeight: 700, padding: "2px 8px", borderRadius: 4, textTransform: "uppercase", letterSpacing: 1 }}>Active</span>}
+                              <div style={{ display: "flex", gap: 6 }}>
+                                <button onClick={() => openEditClassB(c)} style={{ background: C.surfaceDeep, color: C.blue, border: `1px solid ${C.border}`, borderRadius: 5, padding: "4px 12px", cursor: "pointer", fontSize: 12 }}>Edit</button>
+                                <button onClick={() => deleteClassBContract(c.id)} style={{ background: "#3a1a1a", color: "#f87171", border: "none", borderRadius: 5, padding: "4px 12px", cursor: "pointer", fontSize: 12 }}>Remove</button>
+                              </div>
+                            </div>
+                            {allowances.breakdown.length > 0 && (
+                              <div style={{ padding: "0 20px 12px 20px", display: "flex", gap: 8, flexWrap: "wrap" }}>
+                                {allowances.breakdown.map((b, bi) => (
+                                  <span key={bi} style={{ background: "#0f2a1a", border: "1px solid #1a4a2a", borderRadius: 4, color: "#4ade80", fontSize: 10, padding: "2px 8px", fontWeight: 600 }}>{b.label}: {fmt$(b.amount)}</span>
+                                ))}
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* Pay Calculator */}
+                <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+                  <div style={{ padding: "14px 20px", background: C.surfaceDeep, borderBottom: `2px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <div>
+                      <div style={{ color: C.gold, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5 }}>💰 Pay Calculator — {MONTH_NAMES[calMonth]} {calYear}</div>
+                      <div style={{ color: C.faint, fontSize: 10, marginTop: 3 }}>
+                        Class A: {fmt$(DAILY)} / {fmt$(HALF)} half · Class B: {fmt$(CLASSB_DAILY)}/day · Net: 69%
+                        {activeContracts.length > 0 && <span style={{ color: "#a78bfa", marginLeft: 8 }}>· {activeContracts.map(c => c.label || "Class B").join(", ")} active this month</span>}
+                      </div>
+                    </div>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1 }}>Monthly net (taxable)</div>
+                      <div style={{ color: "#4ade80", fontSize: 20, fontWeight: 800, marginTop: 2 }}>{fmt$(totalNet)}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 1 }}>Gross: {fmt$(totalGross)}</div>
+                      {monthTaxFreeAllowances.total > 0 && <>
+                        <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1, marginTop: 8 }}>+ Tax-Free Allowances</div>
+                        <div style={{ color: "#86efac", fontSize: 16, fontWeight: 800 }}>{fmt$(monthTaxFreeAllowances.total)}</div>
+                        <div style={{ color: "#4ade80", fontSize: 12, fontWeight: 800, marginTop: 4, borderTop: `1px solid ${C.border}`, paddingTop: 4 }}>Total in pocket: {fmt$(totalNet + monthTaxFreeAllowances.total)}</div>
+                      </>}
+                    </div>
+                  </div>
+                  <div style={{ padding: "16px 20px", display: "flex", gap: 16, flexWrap: "wrap" }}>
+                    <PeriodCard label="Period 1" dateRange={`${MONTH_NAMES[calMonth]} 1 – 15`} payDate={payDate1} data={p1} accent={C.blue} stubKey="p1" />
+                    <PeriodCard label="Period 2" dateRange={`${MONTH_NAMES[calMonth]} 16 – ${lastDayOfMonth(calYear,calMonth)}`} payDate={payDate2} data={p2} accent={C.gold} stubKey="p2" />
+                  </div>
+                  {monthTaxFreeAllowances.breakdown.length > 0 && (
+                    <div style={{ padding: "14px 20px", borderTop: `1px solid ${C.border}`, background: C.surfaceDeep }}>
+                      <div style={{ color: "#86efac", fontSize: 10, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5, marginBottom: 10 }}>🍃 Tax-Free Allowances This Month</div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
+                        {monthTaxFreeAllowances.breakdown.map((b, bi) => (
+                          <div key={bi} style={{ background: "#0a2010", border: "1px solid #1a4a2a", borderRadius: 6, padding: "8px 14px", minWidth: 180 }}>
+                            <div style={{ color: "#4ade80", fontSize: 11, fontWeight: 700 }}>{fmt$(b.amount)}</div>
+                            <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>{b.label}</div>
+                            <div style={{ color: C.faint, fontSize: 10, marginTop: 1 }}>{b.contract}</div>
+                          </div>
+                        ))}
+                      </div>
+                      <div style={{ color: C.faint, fontSize: 10, marginTop: 10, fontStyle: "italic" }}>
+                        Rates: Breakfast $24.90 · Lunch $25.20 · Dinner $61.85 · TD Incidental $17.50/day · Field Day $100.00 · Instructor (School) $300/mo · Instructor (Duty) $35.00/day — NJC Travel Directive, effective Apr 1 2024
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* ── YTD Earnings ── */}
+          {(() => {
+            const fmt$ = n => `$${n.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}`;
+            const ytd = calcYTD(calYear);
+            return (
+              <div style={{ marginTop: 16, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+                <div onClick={() => setShowYTD(v => !v)} style={{ padding: "14px 20px", background: C.surfaceDeep, borderBottom: showYTD ? `2px solid ${C.border}` : "none", display: "flex", alignItems: "center", justifyContent: "space-between", cursor: "pointer" }}>
+                  <div style={{ color: C.gold, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5 }}>📊 Year-to-Date Earnings — {calYear}</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+                    <div style={{ textAlign: "right" }}>
+                      <div style={{ color: "#4ade80", fontSize: 18, fontWeight: 800 }}>{fmt$(ytd.ytdNet)}</div>
+                      <div style={{ color: C.muted, fontSize: 11 }}>net · gross {fmt$(ytd.ytdGross)}{ytd.ytdTaxFree > 0 ? ` · +${fmt$(ytd.ytdTaxFree)} tax-free` : ""}</div>
+                    </div>
+                    <span style={{ color: C.faint, fontSize: 16 }}>{showYTD ? "▲" : "▼"}</span>
+                  </div>
+                </div>
+                {showYTD && (
+                  <div style={{ overflowX: "auto" }}>
+                    <table style={{ width: "100%", borderCollapse: "collapse", minWidth: 600 }}>
+                      <thead>
+                        <tr style={{ background: C.surfaceDeep }}>
+                          {["Month","Cl A Days","Cl B Days","Expected Gross","Est. Net","Tax-Free","Actual Paid","Variance"].map(h => (
+                            <th key={h} style={{ ...thStyle, fontSize: 10, padding: "10px 14px", color: C.muted }}>{h}</th>
+                          ))}
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {ytd.months.map(row => {
+                          const hasVariance = row.variance !== null;
+                          const varOk = hasVariance && Math.abs(row.variance) < 0.5;
+                          const varOver = hasVariance && row.variance > 0.5;
+                          const varUnder = hasVariance && row.variance < -0.5;
+                          return (
+                            <tr key={row.month} style={{ borderBottom: `1px solid ${C.border}`, background: row.month === calMonth ? C.surfaceDeep : "transparent" }}>
+                              <td style={{ padding: "10px 14px", color: row.month === calMonth ? C.gold : C.text, fontWeight: row.month === calMonth ? 700 : 400, fontSize: 13 }}>{MONTH_NAMES[row.month]}</td>
+                              <td style={{ padding: "10px 14px", color: C.text, fontSize: 12 }}>{row.classADays > 0 ? row.classADays % 1 === 0 ? row.classADays : row.classADays.toFixed(1) : "—"}</td>
+                              <td style={{ padding: "10px 14px", color: "#a78bfa", fontSize: 12 }}>{row.classBDays > 0 ? row.classBDays : "—"}</td>
+                              <td style={{ padding: "10px 14px", color: C.blue, fontWeight: 700, fontSize: 12 }}>{fmt$(row.gross)}</td>
+                              <td style={{ padding: "10px 14px", color: "#4ade80", fontWeight: 700, fontSize: 12 }}>{fmt$(row.net)}</td>
+                              <td style={{ padding: "10px 14px", color: "#86efac", fontSize: 12 }}>{row.taxFree > 0 ? fmt$(row.taxFree) : "—"}</td>
+                              <td style={{ padding: "10px 14px", fontSize: 12 }}>
+                                {row.actualGross > 0 ? <span style={{ color: C.text }}>{fmt$(row.actualGross)}</span> : <span style={{ color: C.faint }}>—</span>}
+                              </td>
+                              <td style={{ padding: "10px 14px", fontSize: 12 }}>
+                                {hasVariance ? (
+                                  <span style={{ color: varOk ? "#4ade80" : varOver ? "#86efac" : "#f87171", fontWeight: 700 }}>
+                                    {varOk ? "✅" : varOver ? `+${fmt$(row.variance)}` : fmt$(row.variance)}
+                                  </span>
+                                ) : <span style={{ color: C.faint }}>—</span>}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                      <tfoot>
+                        <tr style={{ background: C.surfaceDeep, borderTop: `2px solid ${C.border}` }}>
+                          <td style={{ padding: "12px 14px", color: C.gold, fontWeight: 800, fontSize: 13 }}>TOTAL</td>
+                          <td colSpan={2} />
+                          <td style={{ padding: "12px 14px", color: C.blue, fontWeight: 800, fontSize: 13 }}>{fmt$(ytd.ytdGross)}</td>
+                          <td style={{ padding: "12px 14px", color: "#4ade80", fontWeight: 800, fontSize: 14 }}>{fmt$(ytd.ytdNet)}</td>
+                          <td style={{ padding: "12px 14px", color: "#86efac", fontWeight: 800, fontSize: 13 }}>{ytd.ytdTaxFree > 0 ? fmt$(ytd.ytdTaxFree) : "—"}</td>
+                          <td colSpan={2} />
+                        </tr>
+                      </tfoot>
+                    </table>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
+
+          {/* ── Recurring Duties ── */}
+          <div style={{ marginTop: 16, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+            <div style={{ padding: "14px 20px", background: C.surfaceDeep, borderBottom: `2px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+              <div style={{ color: C.gold, fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5 }}>🔁 Recurring Duties</div>
+              <button onClick={() => { setRecurringForm(EMPTY_RECURRING); setEditRecurringId(null); setShowRecurringForm(true); }}
+                style={{ background: C.gold, color: C.bg, border: "none", borderRadius: 6, padding: "7px 16px", cursor: "pointer", fontWeight: 700, fontSize: 12 }}>+ Add</button>
+            </div>
+            {recurringDuties.length === 0 ? (
+              <div style={{ color: C.faint, padding: "16px 20px", fontSize: 13, fontStyle: "italic" }}>No recurring duties set. Add weekly parade nights, drills, etc.</div>
+            ) : (
+              <div>
+                {recurringDuties.map((r, i) => (
+                  <div key={r.id} style={{ padding: "12px 20px", borderTop: i > 0 ? `1px solid ${C.border}` : "none", display: "flex", alignItems: "center", gap: 14, flexWrap: "wrap", borderLeft: `4px solid ${r.color || C.blue}` }}>
+                    <span style={{ fontSize: 18 }}>{r.badge || "⚓"}</span>
+                    <div style={{ flex: 1 }}>
+                      <div style={{ color: C.text, fontWeight: 700, fontSize: 13 }}>{r.label}</div>
+                      <div style={{ color: C.muted, fontSize: 11, marginTop: 2 }}>
+                        {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].filter((_, i) => r.daysOfWeek.includes(i)).join(", ")}
+                        {r.startDate ? ` · from ${fmtDate(r.startDate)}` : ""}
+                        {r.endDate   ? ` to ${fmtDate(r.endDate)}`       : ""}
+                      </div>
+                    </div>
+                    <div style={{ display: "flex", gap: 6 }}>
+                      <button onClick={() => openEditRecurring(r)} style={btnEdit}>Edit</button>
+                      <button onClick={() => deleteRecurring(r.id)} style={btnDanger}>Remove</button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </div>
+        );
+      })()}
+
+      {/* ════════ JOURNAL TAB ════════ */}
+      {tab === "journal" && (() => {
+        const entries = Object.entries(dayNotes).sort((a,b) => b[0] < a[0] ? -1 : 1);
+        const journalText = dayNotes[journalDate] || "";
+        return (
+          <div style={{ maxWidth: 1200, margin: "0 auto", padding: "28px 20px", display: "flex", gap: 24, flexWrap: "wrap", alignItems: "flex-start" }}>
+            {/* Entry editor */}
+            <div style={{ flex: "1 1 420px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden" }}>
+              <div style={{ padding: "16px 20px", background: C.surfaceDeep, borderBottom: `2px solid ${C.border}`, display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+                <div style={{ color: C.gold, fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5 }}>📓 Journal Entry</div>
+                <input type="date" value={journalDate} onChange={e => setJournalDate(e.target.value)} style={{ ...fieldStyle, width: "auto", fontSize: 13 }} />
+              </div>
+              <div style={{ padding: "20px" }}>
+                <div style={{ color: C.blue, fontSize: 13, fontWeight: 700, marginBottom: 10 }}>{new Date(journalDate + "T00:00:00").toLocaleDateString("en-CA", { weekday: "long", year: "numeric", month: "long", day: "numeric" })}</div>
+                <textarea
+                  value={journalText}
+                  onChange={e => setDayNotes(n => e.target.value ? { ...n, [journalDate]: e.target.value } : (({ [journalDate]: _, ...rest }) => rest)(n))}
+                  placeholder="Write your entry here — notes, tasks, observations, debrief..."
+                  rows={14}
+                  style={{ ...fieldStyle, resize: "vertical", lineHeight: 1.7, fontSize: 13 }}
+                />
+                <div style={{ marginTop: 12, display: "flex", gap: 8, justifyContent: "space-between", alignItems: "center" }}>
+                  <span style={{ color: C.faint, fontSize: 11 }}>{journalText.length > 0 ? `${journalText.length} chars · auto-saved` : "Start typing to create an entry"}</span>
+                  {journalText && <button onClick={() => setDayNotes(n => (({ [journalDate]: _, ...rest }) => rest)(n))} style={{ ...btnDanger, fontSize: 11 }}>Delete Entry</button>}
+                </div>
+              </div>
+            </div>
+
+            {/* Entry list */}
+            <div style={{ flex: "1 1 300px", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, overflow: "hidden", maxHeight: 600, display: "flex", flexDirection: "column" }}>
+              <div style={{ padding: "16px 20px", background: C.surfaceDeep, borderBottom: `2px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div style={{ color: C.gold, fontSize: 12, fontWeight: 800, textTransform: "uppercase", letterSpacing: 1.5 }}>All Entries</div>
+                <span style={{ color: C.faint, fontSize: 11 }}>{entries.length} entries</span>
+              </div>
+              {entries.length === 0 ? (
+                <div style={{ color: C.faint, padding: "32px 20px", fontSize: 13, textAlign: "center", fontStyle: "italic" }}>No journal entries yet. Start writing above.</div>
+              ) : (
+                <div style={{ overflowY: "auto", flex: 1 }}>
+                  {entries.map(([iso, text]) => (
+                    <div key={iso} onClick={() => setJournalDate(iso)} style={{ padding: "14px 20px", borderBottom: `1px solid ${C.border}`, cursor: "pointer", background: iso === journalDate ? C.surfaceDeep : "transparent", borderLeft: `4px solid ${iso === journalDate ? C.gold : "transparent"}` }}>
+                      <div style={{ color: iso === journalDate ? C.gold : C.blue, fontWeight: 700, fontSize: 12 }}>{fmtDate(iso)}</div>
+                      <div style={{ color: C.muted, fontSize: 12, marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: "100%" }}>{text.slice(0, 80)}{text.length > 80 ? "…" : ""}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
+
+      {/* ════════ MODALS ════════ */}
+      {showClassBForm && (
+        <ModalOverlay>
+          <div style={{ background: C.surface, border: `2px solid #a78bfa`, borderRadius: 14, padding: 28, width: "100%", maxWidth: 560, maxHeight: "90vh", overflowY: "auto" }}>
+            <h2 style={{ color: "#a78bfa", margin: "0 0 22px", fontSize: 17, fontWeight: 800 }}>{editClassBId !== null ? "Edit Class B Contract" : "New Class B Contract"}</h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Field label="Contract Name / Label">
+                <TextInput value={classBForm.label} onChange={v => setClassBForm(x => ({ ...x, label: v }))} placeholder="e.g. Ex UNIFIED RESOLVE, Tasking 2025-04" />
+              </Field>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Field label="Start Date"><TextInput type="date" value={classBForm.start} onChange={v => setClassBForm(x => ({ ...x, start: v }))} /></Field>
+                <Field label="End Date">  <TextInput type="date" value={classBForm.end}   onChange={v => setClassBForm(x => ({ ...x, end: v }))} /></Field>
+              </div>
+
+              {/* Allowances Section */}
+              <div style={{ background: C.surfaceDeep, border: `1px solid #2a1a4a`, borderRadius: 10, padding: "16px 18px" }}>
+                <div style={{ color: "#a78bfa", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.2, marginBottom: 14 }}>🍃 Tax-Free Allowances</div>
+
+                {/* TD Per Diem */}
+                <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer", marginBottom: 14 }}>
+                  <input type="checkbox" checked={classBForm.tdPerDiem} onChange={e => setClassBForm(x => ({ ...x, tdPerDiem: e.target.checked }))}
+                    style={{ width: 16, height: 16, accentColor: "#a78bfa", cursor: "pointer" }} />
+                  <div>
+                    <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>TD Per Diem (Incidental Expense Allowance)</div>
+                    <div style={{ color: C.faint, fontSize: 11, marginTop: 1 }}>$17.50/day · applies every calendar day of contract · tax-free</div>
+                  </div>
+                </label>
+
+                {/* Meals */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14, marginBottom: 14 }}>
+                  <div style={{ color: C.blue, fontSize: 12, fontWeight: 700, marginBottom: 10 }}>Meal Allowances (select days of week meals are covered)</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginBottom: 10 }}>
+                    {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d, i) => {
+                      const checked = classBForm.mealDays.includes(i);
+                      return (
+                        <button key={i} onClick={() => setClassBForm(x => ({ ...x, mealDays: checked ? x.mealDays.filter(v => v !== i) : [...x.mealDays, i] }))}
+                          style={{ background: checked ? "#1a3a5c" : C.bg, color: checked ? C.blue : C.faint, border: `1px solid ${checked ? C.blue : C.border}`, borderRadius: 6, padding: "5px 10px", cursor: "pointer", fontSize: 12, fontWeight: 700 }}>
+                          {d}
+                        </button>
+                      );
+                    })}
+                    <button onClick={() => setClassBForm(x => ({ ...x, mealDays: [0,1,2,3,4,5,6] }))} style={{ background: C.surfaceDeep, color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 10px", cursor: "pointer", fontSize: 11 }}>All</button>
+                    <button onClick={() => setClassBForm(x => ({ ...x, mealDays: [1,2,3,4,5] }))} style={{ background: C.surfaceDeep, color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 10px", cursor: "pointer", fontSize: 11 }}>Weekdays</button>
+                    <button onClick={() => setClassBForm(x => ({ ...x, mealDays: [] }))} style={{ background: C.surfaceDeep, color: C.muted, border: `1px solid ${C.border}`, borderRadius: 6, padding: "5px 10px", cursor: "pointer", fontSize: 11 }}>None</button>
+                  </div>
+                  {classBForm.mealDays.length > 0 && (
+                    <div style={{ display: "flex", gap: 14, flexWrap: "wrap" }}>
+                      {[{ key: "mealBreakfast", label: "Breakfast", rate: "$24.90" }, { key: "mealLunch", label: "Lunch", rate: "$25.20" }, { key: "mealDinner", label: "Dinner", rate: "$61.85" }].map(m => (
+                        <label key={m.key} style={{ display: "flex", alignItems: "center", gap: 7, cursor: "pointer" }}>
+                          <input type="checkbox" checked={classBForm[m.key] !== false} onChange={e => setClassBForm(x => ({ ...x, [m.key]: e.target.checked }))}
+                            style={{ width: 14, height: 14, accentColor: C.blue, cursor: "pointer" }} />
+                          <span style={{ color: C.text, fontSize: 12 }}>{m.label} <span style={{ color: C.faint }}>({m.rate})</span></span>
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Field Days */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14, marginBottom: 14 }}>
+                  <div style={{ color: C.blue, fontSize: 12, fontWeight: 700, marginBottom: 8 }}>Field Days — $100.00/day · tax-free</div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <input type="number" min="0" value={classBForm.fieldDays} onChange={e => setClassBForm(x => ({ ...x, fieldDays: Math.max(0, parseInt(e.target.value)||0) }))}
+                      style={{ ...fieldStyle, width: 80 }} />
+                    <span style={{ color: C.muted, fontSize: 12 }}>expected field days</span>
+                    {classBForm.fieldDays > 0 && <span style={{ color: "#4ade80", fontWeight: 700, fontSize: 12 }}>= ${(classBForm.fieldDays * 100).toFixed(2)}</span>}
+                  </div>
+                </div>
+
+                {/* Instructor Allowances */}
+                <div style={{ borderTop: `1px solid ${C.border}`, paddingTop: 14 }}>
+                  <div style={{ color: C.blue, fontSize: 12, fontWeight: 700, marginBottom: 10 }}>CAF Instructor Allowances</div>
+                  <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+                      <input type="checkbox" checked={classBForm.instructorPostedToSchool} onChange={e => setClassBForm(x => ({ ...x, instructorPostedToSchool: e.target.checked }))}
+                        style={{ width: 16, height: 16, accentColor: "#a78bfa", cursor: "pointer" }} />
+                      <div>
+                        <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>Posted to School Allowance</div>
+                        <div style={{ color: C.faint, fontSize: 11, marginTop: 1 }}>$300.00/month · tax-free</div>
+                      </div>
+                    </label>
+                    <label style={{ display: "flex", alignItems: "center", gap: 10, cursor: "pointer" }}>
+                      <input type="checkbox" checked={classBForm.instructorDuty} onChange={e => setClassBForm(x => ({ ...x, instructorDuty: e.target.checked }))}
+                        style={{ width: 16, height: 16, accentColor: "#a78bfa", cursor: "pointer" }} />
+                      <div>
+                        <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>Instructor Duty Allowance</div>
+                        <div style={{ color: C.faint, fontSize: 11, marginTop: 1 }}>$35.00/day · applies every calendar day of contract · tax-free</div>
+                      </div>
+                    </label>
+                  </div>
+                </div>
+              </div>
+
+              {/* Preview */}
+              {classBForm.start && classBForm.end && classBForm.start <= classBForm.end && (() => {
+                const days = Math.round((new Date(classBForm.end+"T00:00:00") - new Date(classBForm.start+"T00:00:00")) / 86400000) + 1;
+                const gross = days * 183.16, net = gross * 0.69;
+                const allowances = calcContractAllowances(classBForm);
+                return (
+                  <div style={{ background: "#0a1a28", border: `1px solid #4c1d95`, borderRadius: 8, padding: "14px 16px" }}>
+                    <div style={{ color: "#a78bfa", fontSize: 11, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, marginBottom: 10 }}>Contract Preview</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: allowances.total > 0 ? 10 : 0 }}>
+                      <div>
+                        <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1 }}>Calendar Days</div>
+                        <div style={{ color: C.text, fontWeight: 700, fontSize: 16, marginTop: 2 }}>{days}</div>
+                      </div>
+                      <div>
+                        <div style={{ color: C.faint, fontSize: 10, textTransform: "uppercase", letterSpacing: 1 }}>Net Pay (69%)</div>
+                        <div style={{ color: "#4ade80", fontWeight: 800, fontSize: 16, marginTop: 2 }}>${net.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</div>
+                      </div>
+                    </div>
+                    {allowances.total > 0 && (
+                      <div style={{ borderTop: `1px solid #2a1a4a`, paddingTop: 10 }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                          <span style={{ color: "#86efac", fontSize: 12, fontWeight: 700 }}>Tax-Free Allowances</span>
+                          <span style={{ color: "#86efac", fontWeight: 800, fontSize: 15 }}>${allowances.total.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</span>
+                        </div>
+                        {allowances.breakdown.map((b, bi) => (
+                          <div key={bi} style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+                            <span style={{ color: C.faint, fontSize: 11 }}>{b.label}</span>
+                            <span style={{ color: "#4ade80", fontSize: 11, fontWeight: 600 }}>${b.amount.toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</span>
+                          </div>
+                        ))}
+                        <div style={{ borderTop: `1px solid #2a1a4a`, paddingTop: 8, marginTop: 6, display: "flex", justifyContent: "space-between" }}>
+                          <span style={{ color: C.text, fontSize: 12, fontWeight: 700 }}>Total in pocket</span>
+                          <span style={{ color: "#4ade80", fontWeight: 800, fontSize: 15 }}>${(net + allowances.total).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g,",")}</span>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+              {classBForm.start && classBForm.end && classBForm.start > classBForm.end && (
+                <div style={{ color: "#f87171", fontSize: 12 }}>⚠ End date must be on or after start date.</div>
+              )}
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 24, justifyContent: "flex-end" }}>
+              <button onClick={() => { setShowClassBForm(false); setClassBForm(EMPTY_CLASSB); setEditClassBId(null); }} style={btnSecondary}>Cancel</button>
+              <button onClick={saveClassBContract} disabled={!classBForm.start || !classBForm.end || classBForm.start > classBForm.end}
+                style={{ ...btnPrimary(!classBForm.start || !classBForm.end || classBForm.start > classBForm.end), background: (!classBForm.start || !classBForm.end || classBForm.start > classBForm.end) ? "#2a1a4a" : "#a78bfa", color: (!classBForm.start || !classBForm.end || classBForm.start > classBForm.end) ? C.faint : C.bg }}>
+                {editClassBId !== null ? "Save Contract" : "Add Contract"}
+              </button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+      {showForm && (
+        <ModalOverlay>
+          <div style={{ background: C.surface, border: `2px solid ${C.gold}`, borderRadius: 14, padding: 28, width: "100%", maxWidth: 520 }}>
+            <h2 style={{ color: C.gold, margin: "0 0 22px", fontSize: 17, fontWeight: 800 }}>{editId ? "Edit Deliverable" : "New Deliverable"}</h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Field label="Title *">     <TextInput value={form.title}       onChange={v => setForm(x => ({ ...x, title: v }))}       placeholder="Deliverable title" /></Field>
+              <Field label="Description"><TextInput value={form.description} onChange={v => setForm(x => ({ ...x, description: v }))} placeholder="Brief description" /></Field>
+              <Field label="Due Date">   <TextInput type="date" value={form.dueDate} onChange={v => setForm(x => ({ ...x, dueDate: v }))} /></Field>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Field label="Status">  <Select value={form.status}   onChange={v => setForm(x => ({ ...x, status: v }))}   options={STATUSES} /></Field>
+                <Field label="Priority"><Select value={form.priority} onChange={v => setForm(x => ({ ...x, priority: v }))} options={PRIORITIES} /></Field>
+              </div>
+              <Field label="Department"><Select value={form.department} onChange={v => setForm(x => ({ ...x, department: v }))} options={DEPARTMENTS} placeholder="— Select Department —" /></Field>
+              <Field label="Notes"><textarea value={form.notes} onChange={e => setForm(x => ({ ...x, notes: e.target.value }))} rows={3} placeholder="Additional notes..." style={{ ...fieldStyle, resize: "vertical" }} /></Field>
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 24, justifyContent: "flex-end" }}>
+              <button onClick={() => { setShowForm(false); setForm(EMPTY_FORM); setEditId(null); }} style={btnSecondary}>Cancel</button>
+              <button onClick={saveDeliverable} disabled={!form.title.trim()} style={btnPrimary(!form.title.trim())}>{editId ? "Save Changes" : "Add Deliverable"}</button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {phaseForm && (
+        <ModalOverlay>
+          <div style={{ background: C.surface, border: `2px solid ${C.blue}`, borderRadius: 14, padding: 28, width: "100%", maxWidth: 460 }}>
+            <h2 style={{ color: C.blue, margin: "0 0 22px", fontSize: 17, fontWeight: 800 }}>{phaseForm.phaseIdx === null ? "Add Phase" : "Edit Phase"}</h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Field label="Phase Name *"><TextInput value={phaseData.name}      onChange={v => setPhaseData(x => ({ ...x, name: v }))}      placeholder="e.g. Planning, Approval, Execution" /></Field>
+              <Field label="Due Date">   <TextInput type="date" value={phaseData.dueDate} onChange={v => setPhaseData(x => ({ ...x, dueDate: v }))} /></Field>
+              <Field label="Status">     <Select value={phaseData.status}    onChange={v => setPhaseData(x => ({ ...x, status: v }))}    options={STATUSES} /></Field>
+              <Field label="Waiting On">
+                <TextInput value={phaseData.waitingOn} onChange={v => setPhaseData(x => ({ ...x, waitingOn: v }))} placeholder="Name or role (leave blank if not blocked)" />
+                <div style={{ color: C.faint, fontSize: 11, marginTop: 5 }}>Fill this in if progress is blocked pending someone else's action.</div>
+              </Field>
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 24, justifyContent: "flex-end" }}>
+              <button onClick={() => { setPhaseForm(null); setPhaseData(EMPTY_PHASE); }} style={btnSecondary}>Cancel</button>
+              <button onClick={savePhase} disabled={!phaseData.name.trim()} style={{ ...btnPrimary(!phaseData.name.trim()), background: phaseData.name.trim() ? C.blue : "#1e3a5f", color: phaseData.name.trim() ? C.bg : C.muted }}>{phaseForm.phaseIdx === null ? "Add Phase" : "Save Phase"}</button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {confirmDelete && (
+        <ModalOverlay>
+          <div style={{ background: C.surface, border: "2px solid #f87171", borderRadius: 12, padding: 32, maxWidth: 380, width: "100%", textAlign: "center" }}>
+            <div style={{ color: "#f87171", fontSize: 17, fontWeight: 800, marginBottom: 10 }}>Delete Deliverable?</div>
+            <div style={{ color: C.blue, fontSize: 14, marginBottom: 24 }}>All phases will also be removed. This cannot be undone.</div>
+            <div style={{ display: "flex", gap: 10, justifyContent: "center" }}>
+              <button onClick={() => setConfirmDelete(null)}            style={btnSecondary}>Cancel</button>
+              <button onClick={() => removeDeliverable(confirmDelete)} style={{ background: "#f87171", color: "#fff", border: "none", borderRadius: 6, padding: "9px 24px", cursor: "pointer", fontWeight: 700 }}>Delete</button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+
+      {showRecurringForm && (
+        <ModalOverlay>
+          <div style={{ background: C.surface, border: `2px solid ${C.gold}`, borderRadius: 14, padding: 28, width: "100%", maxWidth: 460 }}>
+            <h2 style={{ color: C.gold, margin: "0 0 22px", fontSize: 17, fontWeight: 800 }}>{editRecurringId !== null ? "Edit Recurring Duty" : "New Recurring Duty"}</h2>
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <Field label="Duty Name *">
+                <TextInput value={recurringForm.label} onChange={v => setRecurringForm(x => ({ ...x, label: v }))} placeholder="e.g. Tuesday Parade Night, Monthly Standing Order" />
+              </Field>
+              <Field label="Days of Week">
+                <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                  {["Sun","Mon","Tue","Wed","Thu","Fri","Sat"].map((d, i) => {
+                    const checked = recurringForm.daysOfWeek.includes(i);
+                    return (
+                      <button key={i} onClick={() => setRecurringForm(x => ({ ...x, daysOfWeek: checked ? x.daysOfWeek.filter(v => v !== i) : [...x.daysOfWeek, i] }))}
+                        style={{ background: checked ? C.gold : C.bg, color: checked ? C.bg : C.faint, border: `1px solid ${checked ? C.gold : C.border}`, borderRadius: 6, padding: "6px 12px", cursor: "pointer", fontWeight: 700, fontSize: 13 }}>
+                        {d}
+                      </button>
+                    );
+                  })}
+                </div>
+              </Field>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Field label="Start Date (optional)"><TextInput type="date" value={recurringForm.startDate} onChange={v => setRecurringForm(x => ({ ...x, startDate: v }))} /></Field>
+                <Field label="End Date (optional)">  <TextInput type="date" value={recurringForm.endDate}   onChange={v => setRecurringForm(x => ({ ...x, endDate: v }))} /></Field>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+                <Field label="Badge Emoji">
+                  <TextInput value={recurringForm.badge} onChange={v => setRecurringForm(x => ({ ...x, badge: v }))} placeholder="⚓" />
+                </Field>
+                <Field label="Colour">
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <input type="color" value={recurringForm.color} onChange={e => setRecurringForm(x => ({ ...x, color: e.target.value }))}
+                      style={{ width: 40, height: 36, border: "none", background: "none", cursor: "pointer" }} />
+                    <span style={{ color: C.muted, fontSize: 12 }}>{recurringForm.color}</span>
+                  </div>
+                </Field>
+              </div>
+            </div>
+            <div style={{ display: "flex", gap: 10, marginTop: 24, justifyContent: "flex-end" }}>
+              <button onClick={() => { setShowRecurringForm(false); setRecurringForm(EMPTY_RECURRING); setEditRecurringId(null); }} style={btnSecondary}>Cancel</button>
+              <button onClick={saveRecurring} disabled={!recurringForm.label.trim() || recurringForm.daysOfWeek.length === 0} style={btnPrimary(!recurringForm.label.trim() || recurringForm.daysOfWeek.length === 0)}>
+                {editRecurringId !== null ? "Save" : "Add Duty"}
+              </button>
+            </div>
+          </div>
+        </ModalOverlay>
+      )}
+    </div>
+  );
+}
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<Root />);
+  </script>
+</body>
+</html>
