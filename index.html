@@ -612,7 +612,7 @@ function App() {
 
   const calcContractAllowances = (c) => {
     if (!c.start || !c.end || c.start > c.end) return { total: 0, breakdown: [] };
-    const MEAL_B = 24.90, MEAL_L = 25.20, MEAL_D = 61.85, INCIDENTAL = 17.50;
+    const MEAL_B = 24.90, MEAL_L = 25.20, MEAL_D = 61.85, INCIDENTAL = 25.00;
     const mealRate = (c.mealBreakfast !== false ? MEAL_B : 0) + (c.mealLunch !== false ? MEAL_L : 0) + (c.mealDinner !== false ? MEAL_D : 0);
     const mealDays = c.mealDays || [];
     const start = new Date(c.start + "T00:00:00"), end = new Date(c.end + "T00:00:00");
@@ -626,7 +626,7 @@ function App() {
     const instrDuty      = c.instructorDuty ? totalDays * 35 : 0;
     const total = tdTotal + mealTotal + fieldTotal + instrSchool + instrDuty;
     const breakdown = [
-      c.tdPerDiem              && { label: `TD Per Diem (${totalDays} days × $17.50)`,         amount: tdTotal },
+      c.tdPerDiem              && { label: `TD Per Diem (${totalDays} days × $25.00)`,         amount: tdTotal },
       mealDayCount > 0         && { label: `Meals (${mealDayCount} days × $${mealRate.toFixed(2)})`, amount: mealTotal },
       fieldTotal > 0           && { label: `Field Days (${c.fieldDays} × $100.00)`,            amount: fieldTotal },
       c.instructorPostedToSchool && { label: `Instructor – Posted to School (${months} mo × $300)`, amount: instrSchool },
@@ -1393,7 +1393,7 @@ function App() {
                         ))}
                       </div>
                       <div style={{ color: C.faint, fontSize: 10, marginTop: 10, fontStyle: "italic" }}>
-                        Rates: Breakfast $24.90 · Lunch $25.20 · Dinner $61.85 · TD Incidental $17.50/day · Field Day $100.00 · Instructor (School) $300/mo · Instructor (Duty) $35.00/day — NJC Travel Directive, effective Apr 1 2024
+                        Rates: Breakfast $24.90 · Lunch $25.20 · Dinner $61.85 · TD Incidental $25.00/day · Field Day $100.00 · Instructor (School) $300/mo · Instructor (Duty) $35.00/day — NJC Travel Directive, effective Apr 1 2024
                       </div>
                     </div>
                   )}
@@ -1583,7 +1583,7 @@ function App() {
                     style={{ width: 16, height: 16, accentColor: "#a78bfa", cursor: "pointer" }} />
                   <div>
                     <div style={{ color: C.text, fontSize: 13, fontWeight: 600 }}>TD Per Diem (Incidental Expense Allowance)</div>
-                    <div style={{ color: C.faint, fontSize: 11, marginTop: 1 }}>$17.50/day · applies every calendar day of contract · tax-free</div>
+                    <div style={{ color: C.faint, fontSize: 11, marginTop: 1 }}>$25.00/day · applies every calendar day of contract · tax-free</div>
                   </div>
                 </label>
 
